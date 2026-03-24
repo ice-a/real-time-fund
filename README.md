@@ -1,18 +1,37 @@
 # 实时基金估值 (Real-time Fund Valuation)
 
-一个基于 Next.js 开发的纯前端基金估值与重仓股实时追踪工具。采用玻璃拟态设计（Glassmorphism），支持移动端适配。
+一个基于 Next.js 开发的基金估值与重仓股实时追踪工具。采用玻璃拟态设计（Glassmorphism），支持移动端适配。
 预览地址：  
 1. [https://hzm0321.github.io/real-time-fund/](https://hzm0321.github.io/real-time-fund/)
 2. [https://fund.cc.cd/](https://fund.cc.cd/) （加速国内访问）
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=hzm0321%2Freal-time-fund&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=hzm0321/real-time-fund&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=hzm0321/real-time-fund&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=hzm0321/real-time-fund&type=date&legend=top-left" />
+ </picture>
+</a>
 
 ## ✨ 特性
 
 - **实时估值**：通过输入基金编号，实时获取并展示基金的单位净值、估值净值及实时涨跌幅。
 - **重仓追踪**：自动获取基金前 10 大重仓股票，并实时追踪重仓股的盘中涨跌情况。支持收起/展开展示。
 - **纯前端运行**：采用 JSONP 方案直连东方财富、腾讯财经等公开接口，彻底解决跨域问题，支持在 GitHub Pages 等静态环境直接部署。
-- **本地持久化**：使用 `localStorage` 存储已添加的基金列表及配置信息，刷新不丢失。
+- **本地持久化**：使用 `localStorage` 存储已添加的基金列表、持仓、交易记录、定投计划及配置信息，刷新不丢失。
 - **响应式设计**：完美适配 PC 与移动端。针对移动端优化了文字展示、间距及交互体验。
-- **自选功能**：支持将基金添加至“自选”列表，通过 Tab 切换展示全部基金或仅自选基金。自选状态支持持久化及同步清理。
+- **自选功能**：支持将基金添加至"自选"列表，通过 Tab 切换展示全部基金或仅自选基金。自选状态支持持久化及同步清理。
+- **分组管理**：支持创建多个基金分组，方便按用途或类别管理基金。
+- **持仓管理**：记录每只基金的持有份额和成本价，自动计算持仓收益和累计收益。
+- **交易记录**：支持买入/卖出操作，记录交易历史，支持查看单个基金的交易明细。
+- **定投计划**：支持设置自动定投计划，可按日/周/月等周期自动生成买入交易。
+- **云端同步**：通过 Supabase 云端备份数据，支持多设备间数据同步与冲突处理。
+- **自定义排序**：支持多种排序规则（估值涨跌幅、持仓收益、持有金额等），可自由组合和启用/禁用规则。
+- **拖拽排序**：在默认排序模式下可通过拖拽调整基金顺序。
+- **明暗主题**：支持亮色/暗色主题切换，一键换肤。
+- **导入/导出**：支持将配置导出为 JSON 文件备份，或从文件导入恢复。
 - **可自定义频率**：支持设置自动刷新间隔（5秒 - 300秒），并提供手动刷新按钮。
 
 ## 🛠 技术栈
@@ -65,6 +84,12 @@
    NEXT_PUBLIC_Supabase_URL：Supabase控制台 → Project Settings → General → Project ID  
    NEXT_PUBLIC_Supabase_ANON_KEY： Supabase控制台 → Project Settings → API Keys → Publishable key
 
+   示例：
+   ```
+   NEXT_PUBLIC_SUPABASE_URL=https://abcdefghijklmnop.supabase.co
+   NEXT_PUBLIC_SUPABASE_ANON_KEY=xxxxxx
+   ```
+
 2. 邮件数量修改
 
     Supabase 免费项目自带每小时2条邮件服务。如果觉得额度不够，可以改成自己的邮箱SMTP。修改路径在 Supabase控制台 → Authentication → Email → SMTP Settings。  
@@ -72,14 +97,58 @@
 
 3. 修改接收到的邮件为验证码  
 
-    在 Supabase控制台 → Authentication → Email → Confirm sign up，选择 `{{.token}}`。  
+    在 Supabase控制台 → Authentication → Email Templates 中，选择 **Magic Link** 模板进行编辑，在邮件正文中使用变量 `{{ .Token }}` 展示验证码。  
 
 4. 修改验证码位数  
 
     官方验证码位数默认为8位，可自行修改。常见一般为6位。
    在 Supabase控制台 → Authentication → Sign In / Providers → Auth Providers → email → Minimum password length  和 Email OTP Length 都改为6位。
 
-5. 目前项目用到的 sql 语句，查看项目 supabase.sql 文件。
+5. 关闭确认邮件
+
+    在 Supabase控制台 → Authentication → Sign In / Providers → Auth Providers → email 中，关闭 **Confirm email** 选项。这样用户注册后就不需要再去邮箱点击确认链接了，直接使用验证码登录即可。
+
+6. 配置 GitHub 登录（可选）
+
+   如需支持 GitHub OAuth 登录，需完成以下配置：
+
+   **第一步：在 GitHub 创建 OAuth App**
+   - 访问 GitHub → Settings → Developer settings → OAuth Apps → New OAuth App
+   - 填写信息：
+     - Application name：自定义应用名称
+     - Homepage URL：你的应用地址（如 `https://hzm0321.github.io/real-time-fund/`）
+     - Authorization callback URL：`https://<your-supabase-project-id>.supabase.co/auth/v1/callback`
+   - 创建后获取 **Client ID** 和 **Client Secret**
+
+   **第二步：在 Supabase 启用 GitHub Provider**
+   - Supabase控制台 → Authentication → Sign In / Providers → Auth Providers → GitHub
+   - 开启 **GitHub** 开关
+   - 填入 GitHub OAuth App 的 **Client ID** 和 **Client Secret**
+   - 点击 **Save** 保存
+
+   **第三步：配置站点 URL（重要）**
+   - Supabase控制台 → Authentication → URL Configuration
+   - **Site URL**：设置为你的应用主域名（如 `https://hzm0321.github.io/`）
+   - **Redirect URLs**：添加你的应用完整路径（如 `https://hzm0321.github.io/real-time-fund/`）
+
+   配置完成后，用户即可通过 GitHub 账号一键登录。
+
+7. 执行数据库初始化 SQL
+
+   项目需要创建 `user_configs` 表及相关策略才能使用云端同步功能。SQL 语句位于项目 `/doc/supabase.sql` 文件。
+
+   **执行步骤：**
+   - Supabase控制台 → SQL Editor → New query
+   - 复制 `/doc/supabase.sql` 文件中的全部内容，粘贴到编辑器
+   - 点击 **Run** 执行
+
+   SQL 脚本将完成以下操作：
+   - 创建 `user_configs` 表（存储用户配置数据）
+   - 启用行级安全（RLS），确保用户只能访问自己的数据
+   - 创建 SELECT / INSERT / UPDATE 策略
+   - 创建 `update_user_config_partial` 函数（用于增量更新配置）
+
+   执行成功后，可在 Table Editor 中看到 `user_configs` 表。
 
 更多 Supabase 相关内容查阅官方文档。
 
@@ -97,18 +166,27 @@ npm run build
 
 ### Docker运行
 
-需先配置环境变量（与本地开发一致），否则构建出的镜像中 Supabase 等配置为空。可复制 `env.example` 为 `.env` 并填入实际值；若不用登录/反馈功能可留空。
+镜像支持两种配置方式：
 
-1. 构建镜像（构建时会读取当前环境或同目录 `.env` 中的变量）
+- **构建时写入**：构建时通过 `--build-arg` 或 `.env` 传入 `NEXT_PUBLIC_*`，值会打进镜像，运行时无需再传。
+- **运行时替换**：构建时不传（或使用默认占位符），启动容器时通过 `-e` 或 `--env-file` 传入，入口脚本会在启动 Nginx 前替换静态资源中的占位符。
+
+可复制 `env.example` 为 `.env` 并填入实际值；若不用登录/反馈功能可留空。
+
+1. 构建镜像
 ```bash
+# 方式 A：运行时再注入配置（镜像内为占位符）
 docker build -t real-time-fund .
-# 或通过 --build-arg 传入，例如：
-# docker build -t real-time-fund --build-arg NEXT_PUBLIC_Supabase_URL=xxx --build-arg NEXT_PUBLIC_Supabase_ANON_KEY=xxx --build-arg NEXT_PUBLIC_GA_ID=G-xxxx .
+
+# 方式 B：构建时写入配置
+docker build -t real-time-fund --build-arg NEXT_PUBLIC_SUPABASE_URL=xxx --build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY=xxx .
+# 或依赖同目录 .env：docker compose build
 ```
 
 2. 启动容器
 ```bash
-docker run -d -p 3000:3000 --name fund real-time-fund
+# 若构建时未写入配置，可在此注入（与 --env-file .env 二选一）
+docker run -d -p 3000:3000 --name fund --env-file .env real-time-fund
 ```
 
 #### docker-compose（会读取同目录 `.env` 作为 build-arg 与运行环境）
@@ -116,6 +194,29 @@ docker run -d -p 3000:3000 --name fund real-time-fund
 # 建议先：cp env.example .env 并编辑 .env
 docker compose up -d
 ```
+
+### Docker Hub
+
+镜像已发布至 Docker Hub，可直接拉取运行，无需本地构建。
+
+1. **拉取镜像**
+   ```bash
+   docker pull hzm0321/real-time-fund:latest
+   ```
+
+2. **启动容器**  
+   访问 [http://localhost:3000](http://localhost:3000) 即可使用。
+   ```bash
+   docker run -d -p 3000:3000 --name real-time-fund --restart always hzm0321/real-time-fund:latest
+   ```
+
+3. **使用自定义环境变量（运行时替换）**  
+   镜像内已预置占位符，启动时通过环境变量即可覆盖，无需重新构建。例如使用本地 `.env`：
+   ```bash
+   docker run -d -p 3000:3000 --name real-time-fund --restart always --env-file .env hzm0321/real-time-fund:latest
+   ```
+   或单独指定变量：`-e NEXT_PUBLIC_SUPABASE_URL=xxx -e NEXT_PUBLIC_SUPABASE_ANON_KEY=xxx`。  
+   变量名与本地开发一致：`NEXT_PUBLIC_SUPABASE_URL`、`NEXT_PUBLIC_SUPABASE_ANON_KEY`、`NEXT_PUBLIC_WEB3FORMS_ACCESS_KEY`、`NEXT_PUBLIC_GA_ID`、`NEXT_PUBLIC_GITHUB_LATEST_RELEASE_URL`。
 
 ## 📖 使用说明
 
@@ -126,9 +227,9 @@ docker compose up -d
 
 ## 💬 开发者交流群
 
-欢迎基金实时开发者加入微信群聊讨论开发与协作：  
+欢迎基金实时开发者加入微信群聊讨论开发与协作：
 
-微信开发群人数已满200，如需加入请加微信号 `hzm1998hzm` 。加v备注：`基估宝开发`，邀请入群。
+<img src="./doc/weChatGroupDevelop.jpg" width="300">
 
 ## 📝 免责声明
 

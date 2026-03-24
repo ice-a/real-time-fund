@@ -1,15 +1,22 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence } from 'framer-motion';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
 import { isNumber } from 'lodash';
-import { fetchSmartFundNetValue } from '../api/fund';
+import { fetchFundPingzhongdata, fetchSmartFundNetValue } from '../api/fund';
 import { DatePicker, NumericInput } from './Common';
 import ConfirmModal from './ConfirmModal';
 import { CloseIcon } from './Icons';
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import PendingTradesModal from './PendingTradesModal';
+import { Spinner } from '@/components/ui/spinner';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -33,11 +40,64 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
   const [share, setShare] = useState('');
   const [amount, setAmount] = useState('');
   const [feeRate, setFeeRate] = useState('0');
+  const [minBuyAmount, setMinBuyAmount] = useState(0);
+  const [loadingBuyMeta, setLoadingBuyMeta] = useState(false);
+  const [buyMetaError, setBuyMetaError] = useState(null);
   const [date, setDate] = useState(() => {
     return formatDate();
   });
   const [isAfter3pm, setIsAfter3pm] = useState(nowInTz().hour() >= 15);
   const [calcShare, setCalcShare] = useState(null);
+
+  const parseNumberish = (input) => {
+    if (input === null || typeof input === 'undefined') return null;
+    if (typeof input === 'number') return Number.isFinite(input) ? input : null;
+    const cleaned = String(input).replace(/[^\d.]/g, '');
+    const n = parseFloat(cleaned);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  useEffect(() => {
+    if (!isBuy || !fund?.code) return;
+    let cancelled = false;
+
+    setLoadingBuyMeta(true);
+    setBuyMetaError(null);
+
+    fetchFundPingzhongdata(fund.code)
+      .then((pz) => {
+        if (cancelled) return;
+        const rate = parseNumberish(pz?.fund_Rate);
+        const minsg = parseNumberish(pz?.fund_minsg);
+
+        if (Number.isFinite(minsg)) {
+          setMinBuyAmount(minsg);
+        } else {
+          setMinBuyAmount(0);
+        }
+
+        if (Number.isFinite(rate)) {
+          setFeeRate((prev) => {
+            const prevNum = parseNumberish(prev);
+            const shouldOverride = prev === '' || prev === '0' || prevNum === 0 || prevNum === null;
+            return shouldOverride ? rate.toFixed(2) : prev;
+          });
+        }
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setBuyMetaError(e?.message || '买入信息加载失败');
+        setMinBuyAmount(0);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setLoadingBuyMeta(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isBuy, fund?.code]);
 
   const currentPendingTrades = useMemo(() => {
     return pendingTrades.filter(t => t.fundCode === fund?.code);
@@ -142,7 +202,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
   };
 
   const isValid = isBuy
-    ? (!!amount && !!feeRate && !!date && calcShare !== null)
+    ? (!!amount && !!feeRate && !!date && calcShare !== null && !loadingBuyMeta)
     : (!!share && !!date);
 
   const handleSetShareFraction = (fraction) => {
@@ -153,50 +213,35 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
 
   const [revokeTrade, setRevokeTrade] = useState(null);
 
+  const handleOpenChange = (open) => {
+    if (!open) {
+      onClose?.();
+    }
+  };
+
   return (
-    <motion.div
-      className="modal-overlay"
-      role="dialog"
-      aria-modal="true"
-      aria-label={isBuy ? "加仓" : "减仓"}
-      onClick={onClose}
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-    >
-      <motion.div
-        initial={{ opacity: 0, scale: 0.95, y: 20 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0, scale: 0.95, y: 20 }}
-        className="glass card modal"
-        onClick={(e) => e.stopPropagation()}
-        style={{ maxWidth: '420px' }}
+    <Dialog open onOpenChange={handleOpenChange}>
+      <DialogContent
+        showCloseButton={false}
+        className="glass card modal trade-modal"
+        overlayClassName="modal-overlay"
+        overlayStyle={{ zIndex: 99 }}
+        style={{ maxWidth: '420px', width: '90vw', zIndex: 99 }}
       >
+        <DialogTitle className="sr-only">{isBuy ? '加仓' : '减仓'}</DialogTitle>
         <div className="title" style={{ marginBottom: 20, justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <span style={{ fontSize: '20px' }}>{isBuy ? '📥' : '📤'}</span>
-            <span>{showPendingList ? '待交易队列' : (showConfirm ? (isBuy ? '买入确认' : '卖出确认') : (isBuy ? '加仓' : '减仓'))}</span>
+            <span>{showConfirm ? (isBuy ? '买入确认' : '卖出确认') : (isBuy ? '加仓' : '减仓')}</span>
           </div>
           <button className="icon-button" onClick={onClose} style={{ border: 'none', background: 'transparent' }}>
             <CloseIcon width="20" height="20" />
           </button>
         </div>
 
-        {!showPendingList && !showConfirm && currentPendingTrades.length > 0 && (
+        {!showConfirm && currentPendingTrades.length > 0 && (
           <div
-            style={{
-              marginBottom: 16,
-              background: 'rgba(230, 162, 60, 0.1)',
-              border: '1px solid rgba(230, 162, 60, 0.2)',
-              borderRadius: 8,
-              padding: '8px 12px',
-              fontSize: '12px',
-              color: '#e6a23c',
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              cursor: 'pointer'
-            }}
+            className="trade-pending-alert"
             onClick={() => setShowPendingList(true)}
           >
             <span>⚠️ 当前有 {currentPendingTrades.length} 笔待处理交易</span>
@@ -204,55 +249,6 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
           </div>
         )}
 
-        {showPendingList ? (
-          <div className="pending-list" style={{ maxHeight: '300px', overflowY: 'auto' }}>
-            <div className="pending-list-header" style={{ position: 'sticky', top: 0, zIndex: 1, background: 'rgba(15,23,42,0.95)', backdropFilter: 'blur(6px)', paddingBottom: 8, marginBottom: 8, borderBottom: '1px solid var(--border)' }}>
-              <button
-                className="button secondary"
-                onClick={() => setShowPendingList(false)}
-                style={{ padding: '4px 8px', fontSize: '12px' }}
-              >
-                &lt; 返回
-              </button>
-            </div>
-            <div className="pending-list-items" style={{ paddingTop: 0 }}>
-              {currentPendingTrades.map((trade, idx) => (
-                <div key={trade.id || idx} style={{ background: 'rgba(255,255,255,0.05)', padding: 12, borderRadius: 8, marginBottom: 8 }}>
-                  <div className="row" style={{ justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ fontWeight: 600, fontSize: '14px', color: trade.type === 'buy' ? 'var(--danger)' : 'var(--success)' }}>
-                      {trade.type === 'buy' ? '买入' : '卖出'}
-                    </span>
-                    <span className="muted" style={{ fontSize: '12px' }}>{trade.date} {trade.isAfter3pm ? '(15:00后)' : ''}</span>
-                  </div>
-                  <div className="row" style={{ justifyContent: 'space-between', fontSize: '12px' }}>
-                    <span className="muted">份额/金额</span>
-                    <span>{trade.share ? `${trade.share} 份` : `¥${trade.amount}`}</span>
-                  </div>
-                  <div className="row" style={{ justifyContent: 'space-between', fontSize: '12px', marginTop: 4 }}>
-                    <span className="muted">状态</span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ color: '#e6a23c' }}>等待净值更新...</span>
-                      <button
-                        className="button secondary"
-                        onClick={() => setRevokeTrade(trade)}
-                        style={{
-                          padding: '2px 8px',
-                          fontSize: '10px',
-                          height: 'auto',
-                          background: 'rgba(255,255,255,0.1)',
-                          color: 'var(--text)'
-                        }}
-                      >
-                        撤销
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <>
             {!showConfirm && (
               <div style={{ marginBottom: 16 }}>
                 <div className="fund-name" style={{ fontWeight: 600, fontSize: '16px', marginBottom: 4 }}>{fund?.name}</div>
@@ -263,7 +259,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
             {showConfirm ? (
               isBuy ? (
                 <div style={{ fontSize: '14px' }}>
-                  <div style={{ background: 'rgba(255,255,255,0.05)', borderRadius: 12, padding: 16, marginBottom: 20 }}>
+                  <div className="trade-confirm-card">
                     <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
                       <span className="muted">基金名称</span>
                       <span style={{ fontWeight: 600 }}>{fund?.name}</span>
@@ -288,7 +284,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                       <span className="muted">买入日期</span>
                       <span>{date}</span>
                     </div>
-                    <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8, borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: 8 }}>
+                    <div className="row trade-confirm-divider" style={{ justifyContent: 'space-between', marginBottom: 8, paddingTop: 8 }}>
                       <span className="muted">交易时段</span>
                       <span>{isAfter3pm ? '15:00后' : '15:00前'}</span>
                     </div>
@@ -301,7 +297,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                     <div style={{ marginBottom: 20 }}>
                       <div className="muted" style={{ marginBottom: 8, fontSize: '12px' }}>持仓变化预览</div>
                       <div className="row" style={{ gap: 12 }}>
-                        <div style={{ flex: 1, background: 'rgba(0,0,0,0.2)', padding: 12, borderRadius: 8 }}>
+                        <div className="trade-preview-card" style={{ flex: 1 }}>
                           <div className="muted" style={{ fontSize: '12px', marginBottom: 4 }}>持有份额</div>
                           <div style={{ fontSize: '12px' }}>
                             <span style={{ opacity: 0.7 }}>{holding.share.toFixed(2)}</span>
@@ -310,7 +306,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                           </div>
                         </div>
                         {price ? (
-                          <div style={{ flex: 1, background: 'rgba(0,0,0,0.2)', padding: 12, borderRadius: 8 }}>
+                          <div className="trade-preview-card" style={{ flex: 1 }}>
                             <div className="muted" style={{ fontSize: '12px', marginBottom: 4 }}>持有市值 (估)</div>
                             <div style={{ fontSize: '12px' }}>
                               <span style={{ opacity: 0.7 }}>¥{(holding.share * Number(price)).toFixed(2)}</span>
@@ -326,18 +322,18 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                   <div className="row" style={{ gap: 12 }}>
                     <button
                       type="button"
-                      className="button secondary"
+                      className="button secondary trade-back-btn"
                       onClick={() => setShowConfirm(false)}
-                      style={{ flex: 1, background: 'rgba(255,255,255,0.05)', color: 'var(--text)' }}
+                      style={{ flex: 1 }}
                     >
                       返回修改
                     </button>
                     <button
                       type="button"
-                      className="button"
+                      className="button queue-button"
                       onClick={handleFinalConfirm}
                       disabled={loadingPrice}
-                      style={{ flex: 1, background: 'var(--primary)', opacity: loadingPrice ? 0.6 : 1, color: '#05263b' }}
+                      style={{ flex: 1, background: 'var(--primary)', opacity: loadingPrice ? 0.6 : 1 }}
                     >
                       {loadingPrice ? '请稍候' : (price ? '确认买入' : '加入待处理队列')}
                     </button>
@@ -345,7 +341,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                 </div>
               ) : (
                 <div style={{ fontSize: '14px' }}>
-                  <div style={{ background: 'rgba(255,255,255,0.05)', borderRadius: 12, padding: 16, marginBottom: 20 }}>
+                  <div className="trade-confirm-card">
                     <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
                       <span className="muted">基金名称</span>
                       <span style={{ fontWeight: 600 }}>{fund?.name}</span>
@@ -370,7 +366,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                       <span className="muted">卖出日期</span>
                       <span>{date}</span>
                     </div>
-                    <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8, borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: 8 }}>
+                    <div className="row trade-confirm-divider" style={{ justifyContent: 'space-between', marginBottom: 8, paddingTop: 8 }}>
                       <span className="muted">预计回款</span>
                       <span style={{ color: 'var(--danger)', fontWeight: 700 }}>{loadingPrice ? '计算中...' : (price ? `¥${estimatedReturn.toFixed(2)}` : '待计算')}</span>
                     </div>
@@ -383,7 +379,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                     <div style={{ marginBottom: 20 }}>
                       <div className="muted" style={{ marginBottom: 8, fontSize: '12px' }}>持仓变化预览</div>
                       <div className="row" style={{ gap: 12 }}>
-                        <div style={{ flex: 1, background: 'rgba(0,0,0,0.2)', padding: 12, borderRadius: 8 }}>
+                        <div className="trade-preview-card" style={{ flex: 1 }}>
                           <div className="muted" style={{ fontSize: '12px', marginBottom: 4 }}>持有份额</div>
                           <div style={{ fontSize: '12px' }}>
                             <span style={{ opacity: 0.7 }}>{holding.share.toFixed(2)}</span>
@@ -392,7 +388,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                           </div>
                         </div>
                         {price ? (
-                          <div style={{ flex: 1, background: 'rgba(0,0,0,0.2)', padding: 12, borderRadius: 8 }}>
+                          <div className="trade-preview-card" style={{ flex: 1 }}>
                             <div className="muted" style={{ fontSize: '12px', marginBottom: 4 }}>持有市值 (估)</div>
                             <div style={{ fontSize: '12px' }}>
                               <span style={{ opacity: 0.7 }}>¥{(holding.share * sellPrice).toFixed(2)}</span>
@@ -408,15 +404,15 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                   <div className="row" style={{ gap: 12 }}>
                     <button
                       type="button"
-                      className="button secondary"
+                      className="button secondary trade-back-btn"
                       onClick={() => setShowConfirm(false)}
-                      style={{ flex: 1, background: 'rgba(255,255,255,0.05)', color: 'var(--text)' }}
+                      style={{ flex: 1 }}
                     >
                       返回修改
                     </button>
                     <button
                       type="button"
-                      className="button"
+                      className="button queue-button"
                       onClick={handleFinalConfirm}
                       disabled={loadingPrice}
                       style={{ flex: 1, background: 'var(--danger)', opacity: loadingPrice ? 0.6 : 1 }}
@@ -430,90 +426,105 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
               <form onSubmit={handleSubmit}>
                 {isBuy ? (
                   <>
-                    <div className="form-group" style={{ marginBottom: 16 }}>
-                      <label className="muted" style={{ display: 'block', marginBottom: 8, fontSize: '14px' }}>
-                        加仓金额 (¥) <span style={{ color: 'var(--danger)' }}>*</span>
-                      </label>
-                      <div style={{ border: !amount ? '1px solid var(--danger)' : '1px solid var(--border)', borderRadius: 12 }}>
-                        <NumericInput
-                          value={amount}
-                          onChange={setAmount}
-                          step={100}
-                          min={0}
-                          placeholder="请输入加仓金额"
-                        />
-                      </div>
-                    </div>
+                    <div style={{ position: 'relative' }}>
+                      <div style={{ pointerEvents: loadingBuyMeta ? 'none' : 'auto', opacity: loadingBuyMeta ? 0.55 : 1 }}>
+                        <div className="form-group" style={{ marginBottom: 16 }}>
+                          <label className="muted" style={{ display: 'block', marginBottom: 8, fontSize: '14px' }}>
+                            加仓金额 (¥) <span style={{ color: 'var(--danger)' }}>*</span>
+                          </label>
+                          <div
+                            style={{
+                              border: !amount ? '1px solid var(--danger)' : '1px solid var(--border)',
+                              borderRadius: 12
+                            }}
+                          >
+                            <NumericInput
+                              value={amount}
+                              onChange={setAmount}
+                              step={100}
+                              min={0}
+                              placeholder="请输入加仓金额"
+                            />
+                          </div>
+                        </div>
 
-                    <div className="row" style={{ gap: 12, marginBottom: 16 }}>
-                      <div className="form-group" style={{ flex: 1 }}>
-                        <label className="muted" style={{ display: 'block', marginBottom: 8, fontSize: '14px' }}>
-                          买入费率 (%) <span style={{ color: 'var(--danger)' }}>*</span>
-                        </label>
-                        <div style={{ border: !feeRate ? '1px solid var(--danger)' : '1px solid var(--border)', borderRadius: 12 }}>
-                          <NumericInput
-                            value={feeRate}
-                            onChange={setFeeRate}
-                            step={0.01}
-                            min={0}
-                            placeholder="0.12"
-                          />
+                        <div className="row" style={{ gap: 12, marginBottom: 16 }}>
+                          <div className="form-group" style={{ flex: 1 }}>
+                            <label className="muted" style={{ display: 'block', marginBottom: 8, fontSize: '14px' }}>
+                              买入费率 (%) <span style={{ color: 'var(--danger)' }}>*</span>
+                            </label>
+                            <div style={{ border: !feeRate ? '1px solid var(--danger)' : '1px solid var(--border)', borderRadius: 12 }}>
+                              <NumericInput
+                                value={feeRate}
+                                onChange={setFeeRate}
+                                step={0.01}
+                                min={0}
+                                placeholder="0.12"
+                              />
+                            </div>
+                          </div>
+                          <div className="form-group" style={{ flex: 1 }}>
+                            <label className="muted" style={{ display: 'block', marginBottom: 8, fontSize: '14px' }}>
+                              加仓日期 <span style={{ color: 'var(--danger)' }}>*</span>
+                            </label>
+                            <DatePicker value={date} onChange={setDate} />
+                          </div>
+                        </div>
+
+                        <div className="form-group" style={{ marginBottom: 12 }}>
+                          <label className="muted" style={{ display: 'block', marginBottom: 8, fontSize: '14px' }}>
+                            交易时段
+                          </label>
+                          <div className="trade-time-slot row" style={{ gap: 8 }}>
+                            <button
+                              type="button"
+                              className={!isAfter3pm ? 'trade-time-btn active' : 'trade-time-btn'}
+                              onClick={() => setIsAfter3pm(false)}
+                            >
+                              15:00前
+                            </button>
+                            <button
+                              type="button"
+                              className={isAfter3pm ? 'trade-time-btn active' : 'trade-time-btn'}
+                              onClick={() => setIsAfter3pm(true)}
+                            >
+                              15:00后
+                            </button>
+                          </div>
+                        </div>
+
+                        <div style={{ marginBottom: 12, fontSize: '12px' }}>
+                          {buyMetaError ? (
+                            <span className="muted" style={{ color: 'var(--danger)' }}>{buyMetaError}</span>
+                          ) : null}
+                          {loadingPrice ? (
+                            <span className="muted">正在查询净值数据...</span>
+                          ) : price === 0 ? null : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                              <span className="muted">参考净值: {Number(price).toFixed(4)}</span>
+                            </div>
+                          )}
                         </div>
                       </div>
-                      <div className="form-group" style={{ flex: 1 }}>
-                        <label className="muted" style={{ display: 'block', marginBottom: 8, fontSize: '14px' }}>
-                          加仓日期 <span style={{ color: 'var(--danger)' }}>*</span>
-                        </label>
-                        <DatePicker value={date} onChange={setDate} />
-                      </div>
-                    </div>
 
-                    <div className="form-group" style={{ marginBottom: 12 }}>
-                      <label className="muted" style={{ display: 'block', marginBottom: 8, fontSize: '14px' }}>
-                        交易时段
-                      </label>
-                      <div className="row" style={{ gap: 8, background: 'rgba(0,0,0,0.2)', borderRadius: '8px', padding: '4px' }}>
-                        <button
-                          type="button"
-                          onClick={() => setIsAfter3pm(false)}
+                      {loadingBuyMeta && (
+                        <div
                           style={{
-                            flex: 1,
-                            border: 'none',
-                            background: !isAfter3pm ? 'var(--primary)' : 'transparent',
-                            color: !isAfter3pm ? '#05263b' : 'var(--muted)',
-                            borderRadius: '6px',
-                            fontSize: '12px',
-                            cursor: 'pointer',
-                            padding: '6px 8px'
+                            position: 'absolute',
+                            inset: 0,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: 10,
+                            padding: 12,
+                            borderRadius: 12,
+                            background: 'rgba(0,0,0,0.25)',
+                            backdropFilter: 'blur(2px)',
+                            WebkitBackdropFilter: 'blur(2px)',
                           }}
                         >
-                          15:00前
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setIsAfter3pm(true)}
-                          style={{
-                            flex: 1,
-                            border: 'none',
-                            background: isAfter3pm ? 'var(--primary)' : 'transparent',
-                            color: isAfter3pm ? '#05263b' : 'var(--muted)',
-                            borderRadius: '6px',
-                            fontSize: '12px',
-                            cursor: 'pointer',
-                            padding: '6px 8px'
-                          }}
-                        >
-                          15:00后
-                        </button>
-                      </div>
-                    </div>
-
-                    <div style={{ marginBottom: 12, fontSize: '12px' }}>
-                      {loadingPrice ? (
-                        <span className="muted">正在查询净值数据...</span>
-                      ) : price === 0 ? null : (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                          <span className="muted">参考净值: {Number(price).toFixed(4)}</span>
+                          <Spinner className="size-5" />
+                          <span className="muted" style={{ fontSize: 12 }}>正在加载买入费率/最小金额...</span>
                         </div>
                       )}
                     </div>
@@ -544,17 +555,8 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                             <button
                               key={opt.label}
                               type="button"
+                              className="trade-amount-btn"
                               onClick={() => handleSetShareFraction(opt.value)}
-                              style={{
-                                flex: 1,
-                                padding: '4px 8px',
-                                fontSize: '12px',
-                                background: 'rgba(255,255,255,0.1)',
-                                border: 'none',
-                                borderRadius: '4px',
-                                color: 'var(--text)',
-                                cursor: 'pointer'
-                              }}
                             >
                               {opt.label}
                             </button>
@@ -563,7 +565,7 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                       )}
                       {holding && (
                         <div className="muted" style={{ fontSize: '12px', marginTop: 6 }}>
-                          当前持仓: {holding.share.toFixed(2)} 份 {pendingSellShare > 0 && <span style={{ color: '#e6a23c', marginLeft: 8 }}>冻结: {pendingSellShare.toFixed(2)} 份</span>}
+                          当前持仓: {holding.share.toFixed(2)} 份 {pendingSellShare > 0 && <span className="trade-pending-status" style={{ marginLeft: 8 }}>冻结: {pendingSellShare.toFixed(2)} 份</span>}
                         </div>
                       )}
                     </div>
@@ -614,36 +616,18 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                       <label className="muted" style={{ display: 'block', marginBottom: 8, fontSize: '14px' }}>
                         交易时段
                       </label>
-                      <div className="row" style={{ gap: 8, background: 'rgba(0,0,0,0.2)', borderRadius: '8px', padding: '4px' }}>
+                      <div className="trade-time-slot row" style={{ gap: 8 }}>
                         <button
                           type="button"
+                          className={!isAfter3pm ? 'trade-time-btn active' : 'trade-time-btn'}
                           onClick={() => setIsAfter3pm(false)}
-                          style={{
-                            flex: 1,
-                            border: 'none',
-                            background: !isAfter3pm ? 'var(--primary)' : 'transparent',
-                            color: !isAfter3pm ? '#05263b' : 'var(--muted)',
-                            borderRadius: '6px',
-                            fontSize: '12px',
-                            cursor: 'pointer',
-                            padding: '6px 8px'
-                          }}
                         >
                           15:00前
                         </button>
                         <button
                           type="button"
+                          className={isAfter3pm ? 'trade-time-btn active' : 'trade-time-btn'}
                           onClick={() => setIsAfter3pm(true)}
-                          style={{
-                            flex: 1,
-                            border: 'none',
-                            background: isAfter3pm ? 'var(--primary)' : 'transparent',
-                            color: isAfter3pm ? '#05263b' : 'var(--muted)',
-                            borderRadius: '6px',
-                            fontSize: '12px',
-                            cursor: 'pointer',
-                            padding: '6px 8px'
-                          }}
                         >
                           15:00后
                         </button>
@@ -663,21 +647,19 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
                 )}
 
                 <div className="row" style={{ gap: 12, marginTop: 12 }}>
-                  <button type="button" className="button secondary" onClick={onClose} style={{ flex: 1, background: 'rgba(255,255,255,0.05)', color: 'var(--text)' }}>取消</button>
+                  <button type="button" className="button secondary trade-cancel-btn" onClick={onClose} style={{ flex: 1 }}>取消</button>
                   <button
                     type="submit"
                     className="button"
-                    disabled={!isValid || loadingPrice}
-                    style={{ flex: 1, opacity: (!isValid || loadingPrice) ? 0.6 : 1 }}
+                    disabled={!isValid || loadingPrice || (isBuy && loadingBuyMeta)}
+                    style={{ flex: 1, opacity: (!isValid || loadingPrice || (isBuy && loadingBuyMeta)) ? 0.6 : 1 }}
                   >
                     确定
                   </button>
                 </div>
               </form>
             )}
-          </>
-        )}
-      </motion.div>
+      </DialogContent>
       <AnimatePresence>
         {revokeTrade && (
           <ConfirmModal
@@ -693,6 +675,12 @@ export default function TradeModal({ type, fund, holding, onClose, onConfirm, pe
           />
         )}
       </AnimatePresence>
-    </motion.div>
+      <PendingTradesModal
+        open={showPendingList}
+        trades={currentPendingTrades}
+        onClose={() => setShowPendingList(false)}
+        onRevoke={(trade) => setRevokeTrade(trade)}
+      />
+    </Dialog>
   );
 }

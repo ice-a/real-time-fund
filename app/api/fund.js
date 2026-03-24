@@ -20,6 +20,35 @@ dayjs.tz.setDefault(TZ);
 const nowInTz = () => dayjs().tz(TZ);
 const toTz = (input) => (input ? dayjs.tz(input, TZ) : nowInTz());
 
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 获取基金「关联板块/跟踪标的」信息（走本地 API，并做 1 天缓存）
+ * 接口：/api/related-sectors?code=xxxxxx
+ * 返回：{ code: string, relatedSectors: string }
+ */
+export const fetchRelatedSectors = async (code, { cacheTime = ONE_DAY_MS } = {}) => {
+  if (!code) return '';
+  const normalized = String(code).trim();
+  if (!normalized) return '';
+
+  const url = `/api/related-sectors?code=${encodeURIComponent(normalized)}`;
+  const cacheKey = `relatedSectors:${normalized}`;
+
+  try {
+    const data = await cachedRequest(async () => {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      return await res.json();
+    }, cacheKey, { cacheTime });
+
+    const relatedSectors = data?.relatedSectors;
+    return relatedSectors ? String(relatedSectors).trim() : '';
+  } catch (e) {
+    return '';
+  }
+};
+
 export const loadScript = (url) => {
   if (typeof document === 'undefined' || !document.body) return Promise.resolve(null);
 
@@ -126,6 +155,87 @@ const parseLatestNetValueFromLsjzContent = (content) => {
   return null;
 };
 
+/**
+ * 解析历史净值数据（支持多条记录）
+ * 返回按日期升序排列的净值数组
+ */
+const parseNetValuesFromLsjzContent = (content) => {
+  if (!content || content.includes('暂无数据')) return [];
+  const rowMatches = content.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+  const results = [];
+  for (const row of rowMatches) {
+    const cells = row.match(/<td[^>]*>(.*?)<\/td>/gi) || [];
+    if (!cells.length) continue;
+    const getText = (td) => td.replace(/<[^>]+>/g, '').trim();
+    const dateStr = getText(cells[0] || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) continue;
+    const navStr = getText(cells[1] || '');
+    const nav = parseFloat(navStr);
+    if (!Number.isFinite(nav)) continue;
+    let growth = null;
+    for (const c of cells) {
+      const txt = getText(c);
+      const m = txt.match(/([-+]?\d+(?:\.\d+)?)\s*%/);
+      if (m) {
+        growth = parseFloat(m[1]);
+        break;
+      }
+    }
+    results.push({ date: dateStr, nav, growth });
+  }
+  // 返回按日期升序排列的结果（API返回的是倒序，需要反转）
+  return results.reverse();
+};
+
+const extractHoldingsReportDate = (html) => {
+  if (!html) return null;
+
+  // 优先匹配带有“报告期 / 截止日期”等关键字附近的日期
+  const m1 = html.match(/(报告期|截止日期)[^0-9]{0,20}(\d{4}-\d{2}-\d{2})/);
+  if (m1) return m1[2];
+
+  // 兜底：取文中出现的第一个 yyyy-MM-dd 格式日期
+  const m2 = html.match(/(\d{4}-\d{2}-\d{2})/);
+  return m2 ? m2[1] : null;
+};
+
+const isLastQuarterReport = (reportDateStr) => {
+  if (!reportDateStr) return false;
+
+  const report = dayjs(reportDateStr, 'YYYY-MM-DD');
+  if (!report.isValid()) return false;
+
+  const now = nowInTz();
+  const m = now.month(); // 0-11
+  const q = Math.floor(m / 3); // 当前季度 0-3 => Q1-Q4
+
+  let lastQ;
+  let year;
+  if (q === 0) {
+    // 当前为 Q1，则上一季度是上一年的 Q4
+    lastQ = 3;
+    year = now.year() - 1;
+  } else {
+    lastQ = q - 1;
+    year = now.year();
+  }
+
+  const quarterEnds = [
+    { month: 2, day: 31 }, // Q1 -> 03-31
+    { month: 5, day: 30 }, // Q2 -> 06-30
+    { month: 8, day: 30 }, // Q3 -> 09-30
+    { month: 11, day: 31 } // Q4 -> 12-31
+  ];
+
+  const { month: endMonth, day: endDay } = quarterEnds[lastQ];
+  const lastQuarterEnd = dayjs(
+    `${year}-${String(endMonth + 1).padStart(2, '0')}-${endDay}`,
+    'YYYY-MM-DD'
+  );
+
+  return report.isSame(lastQuarterEnd, 'day');
+};
+
 export const fetchSmartFundNetValue = async (code, startDate) => {
   const today = nowInTz().startOf('day');
   let current = toTz(startDate).startOf('day');
@@ -199,7 +309,9 @@ export const fetchFundDataFallback = async (c) => {
           gszzl: null,
           zzl: Number.isFinite(latest.growth) ? latest.growth : null,
           noValuation: true,
-          holdings: []
+          holdings: [],
+          holdingsReportDate: null,
+          holdingsIsLastQuarter: false
         });
       } else {
         reject(new Error('未能获取到基金数据'));
@@ -236,16 +348,19 @@ export const fetchFundData = async (c) => {
         gszzl: Number.isFinite(gszzlNum) ? gszzlNum : json.gszzl
       };
       const lsjzPromise = new Promise((resolveT) => {
-        const url = `https://fundf10.eastmoney.com/F10DataApi.aspx?type=lsjz&code=${c}&page=1&per=1&sdate=&edate=`;
+        const url = `https://fundf10.eastmoney.com/F10DataApi.aspx?type=lsjz&code=${c}&page=1&per=2&sdate=&edate=`;
         loadScript(url)
           .then((apidata) => {
             const content = apidata?.content || '';
-            const latest = parseLatestNetValueFromLsjzContent(content);
-            if (latest && latest.nav) {
+            const navList = parseNetValuesFromLsjzContent(content);
+            if (navList.length > 0) {
+              const latest = navList[navList.length - 1];
+              const previousNav = navList.length > 1 ? navList[navList.length - 2] : null;
               resolveT({
                 dwjz: String(latest.nav),
                 zzl: Number.isFinite(latest.growth) ? latest.growth : null,
-                jzrq: latest.date
+                jzrq: latest.date,
+                lastNav: previousNav ? String(previousNav.nav) : null
               });
             } else {
               resolveT(null);
@@ -255,9 +370,23 @@ export const fetchFundData = async (c) => {
       });
       const holdingsPromise = new Promise((resolveH) => {
         const holdingsUrl = `https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code=${c}&topline=10&year=&month=&_=${Date.now()}`;
-        loadScript(holdingsUrl).then(async (apidata) => {
+        const holdingsCacheKey = `fund_holdings_archives_${c}`;
+        cachedRequest(
+          () => loadScript(holdingsUrl),
+          holdingsCacheKey,
+          { cacheTime: 60 * 60 * 1000 }
+        ).then(async (apidata) => {
           let holdings = [];
           const html = apidata?.content || '';
+          const holdingsReportDate = extractHoldingsReportDate(html);
+          const holdingsIsLastQuarter = isLastQuarterReport(holdingsReportDate);
+
+          // 如果不是上一季度末的披露数据，则不展示重仓（并避免继续解析/请求行情）
+          if (!holdingsIsLastQuarter) {
+            resolveH({ holdings: [], holdingsReportDate, holdingsIsLastQuarter: false });
+            return;
+          }
+
           const headerRow = (html.match(/<thead[\s\S]*?<tr[\s\S]*?<\/tr>[\s\S]*?<\/thead>/i) || [])[0] || '';
           const headerCells = (headerRow.match(/<th[\s\S]*?>([\s\S]*?)<\/th>/gi) || []).map(th => th.replace(/<[^>]*>/g, '').trim());
           let idxCode = -1, idxName = -1, idxWeight = -1;
@@ -276,8 +405,12 @@ export const fetchFundData = async (c) => {
             let name = '';
             let weight = '';
             if (idxCode >= 0 && tds[idxCode]) {
-              const m = tds[idxCode].match(/(\d{6})/);
-              code = m ? m[1] : tds[idxCode];
+              const raw = String(tds[idxCode] || '').trim();
+              const mA = raw.match(/(\d{6})/);
+              const mHK = raw.match(/(\d{5})/);
+              // 海外股票常见为英文代码（如 AAPL / usAAPL / TSLA.US / 0700.HK）
+              const mAlpha = raw.match(/\b([A-Za-z]{1,10})\b/);
+              code = mA ? mA[1] : (mHK ? mHK[1] : (mAlpha ? mAlpha[1].toUpperCase() : raw));
             } else {
               const codeIdx = tds.findIndex(txt => /^\d{6}$/.test(txt));
               if (codeIdx >= 0) code = tds[codeIdx];
@@ -300,20 +433,67 @@ export const fetchFundData = async (c) => {
             }
           }
           holdings = holdings.slice(0, 10);
-          const needQuotes = holdings.filter(h => /^\d{6}$/.test(h.code) || /^\d{5}$/.test(h.code));
+          const normalizeTencentCode = (input) => {
+            const raw = String(input || '').trim();
+            if (!raw) return null;
+            // already normalized tencent styles (normalize prefix casing)
+            const mPref = raw.match(/^(us|hk|sh|sz|bj)(.+)$/i);
+            if (mPref) {
+              const p = mPref[1].toLowerCase();
+              const rest = String(mPref[2] || '').trim();
+              // usAAPL / usIXIC: rest use upper; hk00700 keep digits
+              return `${p}${/^\d+$/.test(rest) ? rest : rest.toUpperCase()}`;
+            }
+            const mSPref = raw.match(/^s_(sh|sz|bj|hk)(.+)$/i);
+            if (mSPref) {
+              const p = mSPref[1].toLowerCase();
+              const rest = String(mSPref[2] || '').trim();
+              return `s_${p}${/^\d+$/.test(rest) ? rest : rest.toUpperCase()}`;
+            }
+
+            // A股/北证
+            if (/^\d{6}$/.test(raw)) {
+              const pfx =
+                raw.startsWith('6') || raw.startsWith('9')
+                  ? 'sh'
+                  : raw.startsWith('4') || raw.startsWith('8')
+                    ? 'bj'
+                    : 'sz';
+              return `s_${pfx}${raw}`;
+            }
+            // 港股（数字）
+            if (/^\d{5}$/.test(raw)) return `s_hk${raw}`;
+
+            // 形如 0700.HK / 00001.HK
+            const mHkDot = raw.match(/^(\d{4,5})\.(?:HK)$/i);
+            if (mHkDot) return `s_hk${mHkDot[1].padStart(5, '0')}`;
+
+            // 形如 AAPL / TSLA.US / AAPL.O / BRK.B（腾讯接口对“.”支持不稳定，优先取主代码）
+            const mUsDot = raw.match(/^([A-Za-z]{1,10})(?:\.[A-Za-z]{1,6})$/);
+            if (mUsDot) return `us${mUsDot[1].toUpperCase()}`;
+            if (/^[A-Za-z]{1,10}$/.test(raw)) return `us${raw.toUpperCase()}`;
+
+            return null;
+          };
+
+          const getTencentVarName = (tencentCode) => {
+            const cd = String(tencentCode || '').trim();
+            if (!cd) return '';
+            // s_* uses v_s_*
+            if (/^s_/i.test(cd)) return `v_${cd}`;
+            // us/hk/sh/sz/bj uses v_{code}
+            return `v_${cd}`;
+          };
+
+          const needQuotes = holdings
+            .map((h) => ({
+              h,
+              tencentCode: normalizeTencentCode(h.code),
+            }))
+            .filter((x) => Boolean(x.tencentCode));
           if (needQuotes.length) {
             try {
-              const tencentCodes = needQuotes.map(h => {
-                const cd = String(h.code || '');
-                if (/^\d{6}$/.test(cd)) {
-                  const pfx = cd.startsWith('6') || cd.startsWith('9') ? 'sh' : ((cd.startsWith('4') || cd.startsWith('8')) ? 'bj' : 'sz');
-                  return `s_${pfx}${cd}`;
-                }
-                if (/^\d{5}$/.test(cd)) {
-                  return `s_hk${cd}`;
-                }
-                return null;
-              }).filter(Boolean).join(',');
+              const tencentCodes = needQuotes.map((x) => x.tencentCode).join(',');
               if (!tencentCodes) {
                 resolveH(holdings);
                 return;
@@ -323,22 +503,15 @@ export const fetchFundData = async (c) => {
                 const scriptQuote = document.createElement('script');
                 scriptQuote.src = quoteUrl;
                 scriptQuote.onload = () => {
-                  needQuotes.forEach(h => {
-                    const cd = String(h.code || '');
-                    let varName = '';
-                    if (/^\d{6}$/.test(cd)) {
-                      const pfx = cd.startsWith('6') || cd.startsWith('9') ? 'sh' : ((cd.startsWith('4') || cd.startsWith('8')) ? 'bj' : 'sz');
-                      varName = `v_s_${pfx}${cd}`;
-                    } else if (/^\d{5}$/.test(cd)) {
-                      varName = `v_s_hk${cd}`;
-                    } else {
-                      return;
-                    }
-                    const dataStr = window[varName];
+                  needQuotes.forEach(({ h, tencentCode }) => {
+                    const varName = getTencentVarName(tencentCode);
+                    const dataStr = varName ? window[varName] : null;
                     if (dataStr) {
                       const parts = dataStr.split('~');
-                      if (parts.length > 5) {
-                        h.change = parseFloat(parts[5]);
+                      const isUS = /^us/i.test(String(tencentCode || ''));
+                      const idx = isUS ? 32 : 5;
+                      if (parts.length > idx) {
+                        h.change = parseFloat(parts[idx]);
                       }
                     }
                   });
@@ -354,18 +527,29 @@ export const fetchFundData = async (c) => {
             } catch (e) {
             }
           }
-          resolveH(holdings);
-        }).catch(() => resolveH([]));
+          resolveH({ holdings, holdingsReportDate, holdingsIsLastQuarter });
+        }).catch(() => resolveH({ holdings: [], holdingsReportDate: null, holdingsIsLastQuarter: false }));
       });
-      Promise.all([lsjzPromise, holdingsPromise]).then(([tData, holdings]) => {
+      Promise.all([lsjzPromise, holdingsPromise]).then(([tData, holdingsResult]) => {
+        const {
+          holdings,
+          holdingsReportDate,
+          holdingsIsLastQuarter
+        } = holdingsResult || {};
         if (tData) {
           if (tData.jzrq && (!gzData.jzrq || tData.jzrq >= gzData.jzrq)) {
             gzData.dwjz = tData.dwjz;
             gzData.jzrq = tData.jzrq;
             gzData.zzl = tData.zzl;
+            gzData.lastNav = tData.lastNav;
           }
         }
-        resolve({ ...gzData, holdings });
+        resolve({
+          ...gzData,
+          holdings,
+          holdingsReportDate,
+          holdingsIsLastQuarter
+        });
       });
     };
     scriptGz.onerror = () => {
@@ -438,6 +622,91 @@ export const fetchShanghaiIndexDate = async () => {
   });
 };
 
+/** 大盘指数项：name, code, price, change, changePercent
+ *  同时用于：
+ *  - qt.gtimg.cn 实时快照（code 用于 q= 参数，varKey 为全局变量名）
+ *  - 分时 mini 图（code 传给 minute/query，当不支持分时时会自动回退占位折线）
+ *
+ *  参照产品图：覆盖主要 A 股宽基 + 创业/科创 + 部分海外与港股指数。
+ */
+const MARKET_INDEX_KEYS = [
+  // 行 1：上证 / 深证
+  { code: 'sh000001', varKey: 'v_sh000001', name: '上证指数' },
+  { code: 'sh000016', varKey: 'v_sh000016', name: '上证50' },
+  { code: 'sz399001', varKey: 'v_sz399001', name: '深证成指' },
+  { code: 'sz399330', varKey: 'v_sz399330', name: '深证100' },
+
+  // 行 2：北证 / 沪深300 / 创业板
+  { code: 'bj899050', varKey: 'v_bj899050', name: '北证50' },
+  { code: 'sh000300', varKey: 'v_sh000300', name: '沪深300' },
+  { code: 'sz399006', varKey: 'v_sz399006', name: '创业板指' },
+  { code: 'sz399102', varKey: 'v_sz399102', name: '创业板综' },
+
+  // 行 3：创业板 50 / 科创
+  { code: 'sz399673', varKey: 'v_sz399673', name: '创业板50' },
+  { code: 'sh000688', varKey: 'v_sh000688', name: '科创50' },
+  { code: 'sz399005', varKey: 'v_sz399005', name: '中小100' },
+
+  // 行 4：中证系列
+  { code: 'sh000905', varKey: 'v_sh000905', name: '中证500' },
+  { code: 'sh000906', varKey: 'v_sh000906', name: '中证800' },
+  { code: 'sh000852', varKey: 'v_sh000852', name: '中证1000' },
+  { code: 'sh000903', varKey: 'v_sh000903', name: '中证A100' },
+
+  // 行 5：等权 / 国证 / 纳指
+  { code: 'sh000932', varKey: 'v_sh000932', name: '500等权' },
+  { code: 'sz399303', varKey: 'v_sz399303', name: '国证2000' },
+  { code: 'usIXIC', varKey: 'v_usIXIC', name: '纳斯达克' },
+  { code: 'usNDX', varKey: 'v_usNDX', name: '纳斯达克100' },
+
+  // 行 6：美股三大 + 恒生
+  { code: 'usINX', varKey: 'v_usINX', name: '标普500' },
+  { code: 'usDJI', varKey: 'v_usDJI', name: '道琼斯' },
+  { code: 'hkHSI', varKey: 'v_hkHSI', name: '恒生指数' },
+  { code: 'hkHSTECH', varKey: 'v_hkHSTECH', name: '恒生科技指数' },
+];
+
+function parseIndexRaw(data) {
+  if (!data || typeof data !== 'string') return null;
+  const parts = data.split('~');
+  if (parts.length < 33) return null;
+  const name = parts[1] || '';
+  const price = parseFloat(parts[3], 10);
+  const change = parseFloat(parts[31], 10);
+  const changePercent = parseFloat(parts[32], 10);
+  if (Number.isNaN(price)) return null;
+  return {
+    name,
+    price: Number.isFinite(price) ? price : 0,
+    change: Number.isFinite(change) ? change : 0,
+    changePercent: Number.isFinite(changePercent) ? changePercent : 0,
+  };
+}
+
+export const fetchMarketIndices = async () => {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return [];
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    const codes = MARKET_INDEX_KEYS.map((item) => item.code).join(',');
+    script.src = `https://qt.gtimg.cn/q=${codes}&_t=${Date.now()}`;
+    script.onload = () => {
+      const list = MARKET_INDEX_KEYS.map(({ name: defaultName, varKey }) => {
+        const raw = window[varKey];
+        const parsed = parseIndexRaw(raw);
+        if (!parsed) return { name: defaultName, code: '', price: 0, change: 0, changePercent: 0 };
+        return { ...parsed, code: varKey.replace('v_', '') };
+      });
+      if (document.body.contains(script)) document.body.removeChild(script);
+      resolve(list);
+    };
+    script.onerror = () => {
+      if (document.body.contains(script)) document.body.removeChild(script);
+      reject(new Error('指数数据加载失败'));
+    };
+    document.body.appendChild(script);
+  });
+};
+
 export const fetchLatestRelease = async () => {
   const url = process.env.NEXT_PUBLIC_GITHUB_LATEST_RELEASE_URL;
   if (!url) return null;
@@ -459,73 +728,140 @@ export const submitFeedback = async (formData) => {
   return response.json();
 };
 
-// 使用智谱 GLM 从 OCR 文本中抽取基金名称
-export const extractFundNamesWithLLM = async (ocrText) => {
-  const apiKey = '8df8ccf74a174722847c83b7e222f2af.4A39rJvUeBVDmef1';
-  if (!apiKey || !ocrText) return [];
+const PINGZHONGDATA_GLOBAL_KEYS = [
+  'ishb',
+  'fS_name',
+  'fS_code',
+  'fund_sourceRate',
+  'fund_Rate',
+  'fund_minsg',
+  'stockCodes',
+  'zqCodes',
+  'stockCodesNew',
+  'zqCodesNew',
+  'syl_1n',
+  'syl_6y',
+  'syl_3y',
+  'syl_1y',
+  'Data_fundSharesPositions',
+  'Data_netWorthTrend',
+  'Data_ACWorthTrend',
+  'Data_grandTotal',
+  'Data_rateInSimilarType',
+  'Data_rateInSimilarPersent',
+  'Data_fluctuationScale',
+  'Data_holderStructure',
+  'Data_assetAllocation',
+  'Data_performanceEvaluation',
+  'Data_currentFundManager',
+  'Data_buySedemption',
+  'swithSameType',
+];
 
-  try {
-    const models = ['glm-4.5-flash', 'glm-4.7-flash'];
-    const model = models[Math.floor(Math.random() * models.length)];
+let pingzhongdataQueue = Promise.resolve();
 
-    const resp = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          {
-            role: 'user',
-            content:
-              '你是一个基金 OCR 文本解析助手。' +
-              '从下面的 OCR 文本中抽取其中出现的「基金名称列表」。' +
-              '要求：1）基金名称一般为中文，中间不能有空字符串,可包含部分英文或括号' +
-              '2）名称后面通常会跟着金额或持有金额（数字，可能带千分位逗号和小数）；' +
-              '3）忽略无关信息，只返回你判断为基金名称的字符串；' +
-              '4）去重后输出。输出格式：严格返回 JSON，如 {"fund_names": ["基金名称1","基金名称2"]}，不要输出任何多余说明',
-          },
-          {
-            role: 'user',
-            content: String(ocrText),
-          },
-        ],
-        temperature: 0.2,
-        max_tokens: 1024,
-        thinking: {
-          type: 'disabled',
-        },
-      }),
-    });
-
-    if (!resp.ok) {
-      return [];
-    }
-
-    const data = await resp.json();
-    let content = data?.choices?.[0]?.message?.content?.match(/\{[\s\S]*?\}/)?.[0];
-    if (!isString(content)) return [];
-
-    let parsed;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      return [];
-    }
-
-    const names = parsed?.fund_names;
-    if (!Array.isArray(names)) return [];
-    return names
-      .map((n) => (isString(n) ? n.trim().replaceAll(' ','') : ''))
-      .filter(Boolean);
-  } catch (e) {
-    return [];
-  }
+const enqueuePingzhongdataLoad = (fn) => {
+  const p = pingzhongdataQueue.then(fn, fn);
+  // 避免队列被 reject 永久阻塞
+  pingzhongdataQueue = p.catch(() => undefined);
+  return p;
 };
 
-let historyQueue = Promise.resolve();
+const snapshotPingzhongdataGlobals = (fundCode) => {
+  const out = {};
+  for (const k of PINGZHONGDATA_GLOBAL_KEYS) {
+    if (typeof window?.[k] === 'undefined') continue;
+    try {
+      out[k] = JSON.parse(JSON.stringify(window[k]));
+    } catch (e) {
+      out[k] = window[k];
+    }
+  }
+
+  return {
+    fundCode: out.fS_code || fundCode,
+    fundName: out.fS_name || '',
+    ...out,
+  };
+};
+
+const jsonpLoadPingzhongdata = (fundCode, timeoutMs = 20000) => {
+  return new Promise((resolve, reject) => {
+    if (typeof document === 'undefined' || !document.body) {
+      reject(new Error('无浏览器环境'));
+      return;
+    }
+
+    const url = `https://fund.eastmoney.com/pingzhongdata/${fundCode}.js?v=${Date.now()}`;
+    const script = document.createElement('script');
+    script.src = url;
+    script.async = true;
+
+    let done = false;
+    let timer = null;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      script.onload = null;
+      script.onerror = null;
+      if (document.body.contains(script)) document.body.removeChild(script);
+    };
+
+    timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(new Error('pingzhongdata 请求超时'));
+    }, timeoutMs);
+
+    script.onload = () => {
+      if (done) return;
+      done = true;
+      const data = snapshotPingzhongdataGlobals(fundCode);
+      cleanup();
+      resolve(data);
+    };
+
+    script.onerror = () => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(new Error('pingzhongdata 加载失败'));
+    };
+
+    document.body.appendChild(script);
+  });
+};
+
+const fetchAndParsePingzhongdata = async (fundCode) => {
+  // 使用 JSONP(script 注入) 方式获取并解析 pingzhongdata
+  return enqueuePingzhongdataLoad(() => jsonpLoadPingzhongdata(fundCode));
+};
+
+/**
+ * 获取并解析「基金走势图/资产等」数据（pingzhongdata）
+ * 来源：https://fund.eastmoney.com/pingzhongdata/${fundCode}.js
+ */
+export const fetchFundPingzhongdata = async (fundCode, { cacheTime = 60 * 60 * 1000 } = {}) => {
+  if (!fundCode) throw new Error('fundCode 不能为空');
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    throw new Error('无浏览器环境');
+  }
+
+  const cacheKey = `pingzhongdata_${fundCode}`;
+
+  try {
+    return await cachedRequest(
+      () => fetchAndParsePingzhongdata(fundCode),
+      cacheKey,
+      { cacheTime }
+    );
+  } catch (e) {
+    clearCachedRequest(cacheKey);
+    throw e;
+  }
+};
 
 export const fetchFundHistory = async (code, range = '1m') => {
   if (typeof window === 'undefined') return [];
@@ -539,73 +875,116 @@ export const fetchFundHistory = async (code, range = '1m') => {
     case '6m': start = start.subtract(6, 'month'); break;
     case '1y': start = start.subtract(1, 'year'); break;
     case '3y': start = start.subtract(3, 'year'); break;
+    case 'all': start = dayjs(0).tz(TZ); break;
     default: start = start.subtract(1, 'month');
   }
 
-  const sdate = start.format('YYYY-MM-DD');
-  const edate = end.format('YYYY-MM-DD');
-  const per = 49;
+  // 业绩走势统一走 pingzhongdata.Data_netWorthTrend，
+  // 同时附带 Data_grandTotal（若存在，格式为 [{ name, data: [[ts, val], ...] }, ...]）
+  try {
+    const pz = await fetchFundPingzhongdata(code);
+    const trend = pz?.Data_netWorthTrend;
+    const grandTotal = pz?.Data_grandTotal;
 
-  return new Promise((resolve) => {
-    historyQueue = historyQueue.then(async () => {
-      let allData = [];
-      let page = 1;
-      let totalPages = 1;
+    if (Array.isArray(trend) && trend.length) {
+      const startMs = start.startOf('day').valueOf();
+      const endMs = end.endOf('day').valueOf();
 
-      try {
-        const parseContent = (content) => {
-            if (!content) return [];
-            const rows = content.split('<tr>');
-            const data = [];
-            for (const row of rows) {
-                const cells = row.match(/<td[^>]*>(.*?)<\/td>/g);
-                if (cells && cells.length >= 2) {
-                    const dateStr = cells[0].replace(/<[^>]+>/g, '').trim();
-                    const valStr = cells[1].replace(/<[^>]+>/g, '').trim();
-                    const val = parseFloat(valStr);
-                    if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr) && !isNaN(val)) {
-                        data.push({ date: dateStr, value: val });
-                    }
-                }
-            }
-            return data;
-        };
-
-        // Fetch first page to get metadata
-        const firstUrl = `https://fundf10.eastmoney.com/F10DataApi.aspx?type=lsjz&code=${code}&page=${page}&per=${per}&sdate=${sdate}&edate=${edate}`;
-        const firstApidata = await loadScript(firstUrl);
-
-        if (!firstApidata || !firstApidata.content || firstApidata.content.includes('暂无数据')) {
-          resolve([]);
-          return;
-        }
-
-        // Parse total pages
-        if (firstApidata.pages) {
-            totalPages = parseInt(firstApidata.pages, 10) || 1;
-        }
-
-        allData = allData.concat(parseContent(firstApidata.content));
-
-        // Fetch remaining pages
-        for (page = 2; page <= totalPages; page++) {
-             const nextUrl = `https://fundf10.eastmoney.com/F10DataApi.aspx?type=lsjz&code=${code}&page=${page}&per=${per}&sdate=${sdate}&edate=${edate}`;
-             const nextApidata = await loadScript(nextUrl);
-             if (nextApidata && nextApidata.content) {
-                 allData = allData.concat(parseContent(nextApidata.content));
-             }
-        }
-
-        // The data comes in reverse chronological order (newest first), so we need to reverse it for the chart (oldest first)
-        resolve(allData.reverse());
-
-      } catch (e) {
-        console.error('Fetch history error:', e);
-        resolve([]);
+      // 若起始日没有净值，则往前推到最近一日有净值的数据作为有效起始
+      const validTrend = trend
+        .filter((d) => d && typeof d.x === 'number' && Number.isFinite(Number(d.y)) && d.x <= endMs)
+        .sort((a, b) => a.x - b.x);
+      const startDayEndMs = startMs + 24 * 60 * 60 * 1000 - 1;
+      const hasPointOnStartDay = validTrend.some((d) => d.x >= startMs && d.x <= startDayEndMs);
+      let effectiveStartMs = startMs;
+      if (!hasPointOnStartDay) {
+        const lastBeforeStart = validTrend.filter((d) => d.x < startMs).pop();
+        if (lastBeforeStart) effectiveStartMs = lastBeforeStart.x;
       }
-    }).catch((e) => {
-       console.error('Queue error:', e);
-       resolve([]);
+
+      const out = validTrend
+        .filter((d) => d.x >= effectiveStartMs && d.x <= endMs)
+        .map((d) => {
+          const value = Number(d.y);
+          const date = dayjs(d.x).tz(TZ).format('YYYY-MM-DD');
+          return { date, value };
+        });
+
+      // 解析 Data_grandTotal 为多条对比曲线，使用同一有效起始日
+      if (Array.isArray(grandTotal) && grandTotal.length) {
+        const grandTotalSeries = grandTotal
+          .map((series) => {
+            if (!series || !series.data || !Array.isArray(series.data)) return null;
+            const name = series.name || '';
+            const points = series.data
+              .filter((item) => Array.isArray(item) && typeof item[0] === 'number')
+              .map(([ts, val]) => {
+                if (ts < effectiveStartMs || ts > endMs) return null;
+                const numVal = Number(val);
+                if (!Number.isFinite(numVal)) return null;
+                const date = dayjs(ts).tz(TZ).format('YYYY-MM-DD');
+                return { ts, date, value: numVal };
+              })
+              .filter(Boolean);
+            if (!points.length) return null;
+            return { name, points };
+          })
+          .filter(Boolean);
+
+        if (grandTotalSeries.length) {
+          out.grandTotalSeries = grandTotalSeries;
+        }
+      }
+
+      if (out.length) return out;
+    }
+  } catch (e) {
+    return [];
+  }
+  return [];
+};
+
+const API_KEYS = [
+  'sk-25b8a4a3d88a49e82e87c981d9d8f6b4',
+  'sk-1565f822d5bd745b6529cfdf28b55574'
+  // 添加更多 API Key 到这里
+];
+
+// 随机从数组中选择一个 API Key
+const getRandomApiKey = () => {
+  if (!API_KEYS.length) return null;
+  return API_KEYS[Math.floor(Math.random() * API_KEYS.length)];
+};
+
+export const parseFundTextWithLLM = async (text) => {
+  const apiKey = getRandomApiKey();
+  if (!apiKey || !text) return null;
+
+  try {
+    const response = await fetch('https://apis.iflow.cn/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'qwen3-max',
+        messages: [
+          { role: 'system', content: "你是一个基金文本解析助手。请从提供的OCR文本中执行以下任务：\n抽取所有基金信息，包括：基金名称：中文字符串（可含英文或括号），名称后常跟随金额数字。基金代码：6位数字（如果存在）。持有金额：数字格式（可能含千分位逗号或小数，如果存在）。持有收益：数字格式（可能含千分位逗号或小数，如果存在）。忽略无关文本。输出格式：以JSON数组形式返回结果，每个基金信息为一个对象，包含以下字段：基金名称（必填，字符串）基金代码（可选，字符串，不存在时为空字符串）持有金额（可选，字符串，不存在时为空字符串）持有收益（可选，字符串，不存在时为空字符串）示例输出：[{'fundName':'华夏成长混合','fundCode':'000001','holdAmounts':'50,000.00','holdGains':'2,500.00'},{'fundName':'易方达消费行业','fundCode':'','holdAmounts':'10,000.00','holdGains':'}]。除了示例输出的内容外，不要输出任何多余内容"},
+          { role: 'user', content: text }
+        ],
+        temperature: 0.3,
+        max_tokens: 2000
+      })
     });
-  });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const data = await response.json();
+    return data?.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    return null;
+  }
 };
