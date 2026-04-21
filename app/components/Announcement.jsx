@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-const ANNOUNCEMENT_KEY = 'hasClosedAnnouncement_v20';
+const ANNOUNCEMENT_KEY = 'hasClosedAnnouncement_v1.3.0';
 
 export default function Announcement() {
   const [isVisible, setIsVisible] = useState(false);
@@ -75,15 +75,11 @@ export default function Announcement() {
               <span>公告</span>
             </div>
             <div style={{ color: 'var(--text)', lineHeight: '1.6', fontSize: '15px', overflowY: 'auto', minHeight: 0, flex: 1, paddingRight: '4px' }}>
-              <p>v0.2.9 更新内容：</p>
-              <p>1. 排序新增按昨日涨幅排序。</p>
-              <p>2. 排序个性化设置支持切换排序形式。</p>
-              <p>3. 全局设置新增显示/隐藏大盘指数。</p>
-              <p>4. 新增持有天数。</p>
-              <p>5. 登录方式支持 Github。</p>
-              <br/>
-              关联板块实时估值还在测试，会在近期上线。
-              <p>如有建议和问题，欢迎进用户支持群反馈。</p>
+              <p>v1.3.0 更新内容如下：</p>
+              <p>1. 新增标签列，可自定义基金标签，支持批量添加。</p>
+              <p>2. 新增持仓成本、成本净值列。</p>
+              <p>3. 拍照识别方案调整（需登录）。</p>
+              <p>4. 修复我的收益日历展示样式。</p>
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '8px' }}>

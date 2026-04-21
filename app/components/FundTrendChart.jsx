@@ -1,7 +1,9 @@
 'use client';
 
 import { useState, useEffect, useMemo, useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { fetchFundHistory } from '../api/fund';
+import * as qk from '../lib/query-keys';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ChevronIcon } from './Icons';
 import {
@@ -16,7 +18,6 @@ import {
   Filler
 } from 'chart.js';
 import { Line } from 'react-chartjs-2';
-import { cachedRequest } from '../lib/cacheRequest';
 import FundHistoryNetValue from './FundHistoryNetValue';
 
 ChartJS.register(
@@ -30,6 +31,8 @@ ChartJS.register(
   Filler
 );
 
+const EMPTY_FUND_HISTORY = [];
+
 const CHART_COLORS = {
   dark: {
     danger: '#f87171',
@@ -39,6 +42,18 @@ const CHART_COLORS = {
     border: '#1f2937',
     text: '#e5e7eb',
     crosshairText: '#0f172a',
+    grandLine: [
+      'rgba(34,211,238,0.55)',
+      'rgba(156,163,175,0.55)',
+      'rgba(251,146,60,0.55)',
+      'rgba(229,231,235,0.45)',
+    ],
+    grandLegend: [
+      'rgba(34,211,238,0.55)',
+      'rgba(156,163,175,0.55)',
+      'rgba(251,146,60,0.55)',
+      'rgba(229,231,235,0.45)',
+    ],
   },
   light: {
     danger: '#dc2626',
@@ -48,6 +63,18 @@ const CHART_COLORS = {
     border: '#e2e8f0',
     text: '#0f172a',
     crosshairText: '#ffffff',
+    grandLine: [
+      'rgba(8,145,178,0.5)',
+      'rgba(71,85,105,0.45)',
+      'rgba(249,115,22,0.5)',
+      'rgba(15,23,42,0.35)',
+    ],
+    grandLegend: [
+      'rgba(8,145,178,0.5)',
+      'rgba(71,85,105,0.45)',
+      'rgba(249,115,22,0.5)',
+      'rgba(15,23,42,0.35)',
+    ],
   }
 };
 
@@ -57,9 +84,6 @@ function getChartThemeColors(theme) {
 
 export default function FundTrendChart({ code, isExpanded, onToggleExpand, transactions = [], theme = 'dark', hideHeader = false }) {
   const [range, setRange] = useState('3m');
-  const [data, setData] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
   const chartRef = useRef(null);
   const hoverTimeoutRef = useRef(null);
   const clearActiveIndexRef = useRef(null);
@@ -72,37 +96,18 @@ export default function FundTrendChart({ code, isExpanded, onToggleExpand, trans
 
   const chartColors = useMemo(() => getChartThemeColors(theme), [theme]);
 
-  useEffect(() => {
-    // If collapsed, don't fetch data unless we have no data yet
-    if (!isExpanded && data.length > 0) return;
+  const {
+    data: historyRaw,
+    isPending: loading,
+    isError,
+  } = useQuery({
+    queryKey: qk.fundHistory(code, range),
+    queryFn: () => fetchFundHistory(code, range),
+    enabled: Boolean(code) && isExpanded,
+    staleTime: 10 * 60 * 1000,
+  });
 
-    let active = true;
-    setLoading(true);
-    setError(null);
-    const cacheKey = `fund_history_${code}_${range}`;
-
-    if (isExpanded) {
-      cachedRequest(
-        () => fetchFundHistory(code, range),
-        cacheKey,
-        { cacheTime: 10 * 60 * 1000 }
-      )
-        .then(res => {
-          if (active) {
-            setData(res || []);
-            setLoading(false);
-          }
-        })
-        .catch(err => {
-          if (active) {
-            setError(err);
-            setLoading(false);
-          }
-        });
-
-    }
-    return () => { active = false; };
-  }, [code, range, isExpanded, data.length]);
+  const data = historyRaw ?? EMPTY_FUND_HISTORY;
 
   const ranges = [
     { label: '近1月', value: '1m' },
@@ -157,15 +162,7 @@ export default function FundTrendChart({ code, isExpanded, onToggleExpand, trans
 
     // 将 Data_grandTotal 的多条曲线按日期对齐到主 labels 上
     const labels = data.map(d => d.date);
-    // 对比线颜色：避免与主线红/绿（upColor/downColor）重复
-    // 第三条对比线需要在亮/暗主题下都足够清晰，因此使用高对比的橙色强调
-    const grandAccent3 = theme === 'light' ? '#f97316' : '#fb923c';
-    const grandColors = [
-      primaryColor,
-      chartColors.muted,
-      grandAccent3,
-      chartColors.text,
-    ];
+    const grandColors = chartColors.grandLine;
     // 隐藏第一条对比线（数据与图示）；第二条用原第一条颜色，第三条用原第二条，顺延
     const visibleGrandSeries = grandTotalSeries.filter((_, idx) => idx > 0);
     const grandDatasets = visibleGrandSeries.map((series, displayIdx) => {
@@ -199,7 +196,7 @@ export default function FundTrendChart({ code, isExpanded, onToggleExpand, trans
         data: seriesData,
         borderColor: color,
         backgroundColor: color,
-        borderWidth: 1.5,
+        borderWidth: 1,
         pointRadius: 0,
         pointHoverRadius: 3,
         fill: false,
@@ -620,13 +617,7 @@ export default function FundTrendChart({ code, isExpanded, onToggleExpand, trans
             .filter((_, idx) => idx > 0)
             .map((series, displayIdx) => {
               const idx = displayIdx + 1;
-              const legendAccent3 = theme === 'light' ? '#f97316' : '#fb923c';
-              const legendColors = [
-                primaryColor,
-                chartColors.muted,
-                legendAccent3,
-                chartColors.text,
-              ];
+              const legendColors = chartColors.grandLegend;
               const color = legendColors[displayIdx % legendColors.length];
               const key = `${series.name || 'series'}_${idx}`;
             const isHidden = hiddenGrandSeries.has(key);
@@ -762,9 +753,9 @@ export default function FundTrendChart({ code, isExpanded, onToggleExpand, trans
           </div>
         )}
 
-        {!loading && data.length === 0 && (
+        {!loading && (isError || data.length === 0) && (
           <div className="chart-overlay">
-            <span className="muted" style={{ fontSize: '12px' }}>暂无数据</span>
+            <span className="muted" style={{ fontSize: '12px' }}>{isError ? '加载失败' : '暂无数据'}</span>
           </div>
         )}
 
