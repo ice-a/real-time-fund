@@ -2,14 +2,15 @@
 
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { storageStore } from '../stores';
 
-const ANNOUNCEMENT_KEY = 'hasClosedAnnouncement_v1.3.0';
+const ANNOUNCEMENT_KEY = 'hasClosedAnnouncement_v1.5.1';
 
 export default function Announcement() {
   const [isVisible, setIsVisible] = useState(false);
 
   useEffect(() => {
-    const hasClosed = localStorage.getItem(ANNOUNCEMENT_KEY);
+    const hasClosed = storageStore.getItem(ANNOUNCEMENT_KEY);
     if (!hasClosed) {
       setIsVisible(true);
     }
@@ -18,15 +19,17 @@ export default function Announcement() {
   const handleClose = () => {
     // 清理历史 ANNOUNCEMENT_KEY
     const keysToRemove = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith('hasClosedAnnouncement_v') && key !== ANNOUNCEMENT_KEY) {
-        keysToRemove.push(key);
+    if (typeof window !== 'undefined') {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('hasClosedAnnouncement_v') && key !== ANNOUNCEMENT_KEY) {
+          keysToRemove.push(key);
+        }
       }
     }
-    keysToRemove.forEach((k) => localStorage.removeItem(k));
+    keysToRemove.forEach((k) => storageStore.removeItem(k));
 
-    localStorage.setItem(ANNOUNCEMENT_KEY, 'true');
+    storageStore.setItem(ANNOUNCEMENT_KEY, 'true');
     setIsVisible(false);
   };
 
@@ -75,11 +78,8 @@ export default function Announcement() {
               <span>公告</span>
             </div>
             <div style={{ color: 'var(--text)', lineHeight: '1.6', fontSize: '15px', overflowY: 'auto', minHeight: 0, flex: 1, paddingRight: '4px' }}>
-              <p>v1.3.0 更新内容如下：</p>
-              <p>1. 新增标签列，可自定义基金标签，支持批量添加。</p>
-              <p>2. 新增持仓成本、成本净值列。</p>
-              <p>3. 拍照识别方案调整（需登录）。</p>
-              <p>4. 修复我的收益日历展示样式。</p>
+              <p>v1.5.1 更新内容如下：</p>
+              <p>1. 新增全球 qdii 估值数据(需登录)。</p>
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '8px' }}>

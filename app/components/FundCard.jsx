@@ -8,7 +8,8 @@ import timezone from 'dayjs/plugin/timezone';
 import isSameOrAfter from 'dayjs/plugin/isSameOrAfter';
 import { isNumber, isString } from 'lodash';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Stat } from './Common';
+import { Empty, EmptyHeader, EmptyTitle, EmptyDescription } from '@/components/ui/empty';
+import { Stat, ConsecutiveTrendBadge } from './Common';
 import FundTrendChart from './FundTrendChart';
 import FundIntradayChart from './FundIntradayChart';
 import FundDailyEarnings from './FundDailyEarnings';
@@ -23,6 +24,7 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { getTagThemeBadgeProps } from './AddTagDialog';
 import { cn } from '@/lib/utils';
+import { useStorageStore } from "@/app/stores";
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -45,13 +47,16 @@ const formatDisplayDate = (value) => {
   const d = toTz(value);
   if (!d.isValid()) return value;
 
-  const hasTime = /[T\s]\d{2}:\d{2}/.test(String(value));
+  // 如果是数字（时间戳）或者字符串中包含显式的时间模式，则展示时分
+  const isTimestamp = typeof value === 'number' || (typeof value === 'string' && /^\d{10,13}$/.test(value));
+  const hasTimePattern = /[T\s]\d{1,2}:\d{2}/.test(String(value));
+  const showTime = isTimestamp || hasTimePattern;
 
-  return hasTime ? d.format('MM-DD HH:mm') : d.format('MM-DD');
+  return showTime ? d.format('MM-DD HH:mm') : d.format('MM-DD');
 };
 
 export default function FundCard({
-  fund: f,
+  fundCode,
   isHoldingLinked = false,
   todayStr,
   currentTab,
@@ -82,10 +87,16 @@ export default function FundCard({
   masked = false,
   fundTags = [],
   onFundTagsClick,
+  fundExtraData,
+  onDataSourceClick,
 }) {
-  const holding = holdings[f?.code];
+  const {
+    funds,
+  } = useStorageStore();
+  const f = useMemo(() => funds?.find((item) => item.code === fundCode), [funds, fundCode]);
+  const holding = holdings?.[f?.code];
   const profit = getHoldingProfit?.(f, holding) ?? null;
-  const hasHoldings = f.holdingsIsLastQuarter && Array.isArray(f.holdings) && f.holdings.length > 0;
+  const hasHoldings = f?.holdingsIsLastQuarter && Array.isArray(f?.holdings) && f?.holdings.length > 0;
   // “我的收益”(每日收益)只依赖份额；成本价缺失也应可展示
   const hasHoldingShare =
     holding &&
@@ -112,6 +123,8 @@ export default function FundCard({
     return dailyEarningsSeries;
   }, [dailyEarningsSeries, hasHoldingShare]);
 
+  if (!f) return null;
+
   const showFavoriteButton = currentTab === 'all' || currentTab === 'fav';
   const relatedSectorRaw = f?.relatedSector != null ? String(f.relatedSector).trim() : '';
   const relatedSectorQuoteName = f?.relatedSectorQuoteName != null
@@ -125,7 +138,7 @@ export default function FundCard({
     : '';
 
   const holdingLocked = (currentTab === 'all' || currentTab === 'fav') && isHoldingLinked;
-  const holdingLockedTitle = '持仓来自自定义分组汇总，无法在「全部/自选」设置持仓金额';
+  const holdingLinkedTitle = '持仓来自自定义分组汇总，点击选择分组后操作';
 
   const style = layoutMode === 'drawer' ? {
     border: 'none',
@@ -144,8 +157,8 @@ export default function FundCard({
         ...style,
       }}
     >
-      <div className="row" style={{ marginBottom: 10 }}>
-        <div className="title">
+      <div className="row" style={{ marginBottom: 10, alignItems: 'center', flexWrap: 'nowrap', alignContent: 'center' }}>
+        <div className="title" style={{ flex: '1 1 auto', minWidth: 0 }}>
           {showFavoriteButton ? (
             <button
               className={`icon-button fav-button ${favorites?.has(f.code) ? 'active' : ''}`}
@@ -158,7 +171,7 @@ export default function FundCard({
               <StarIcon width="18" height="18" filled={favorites?.has(f.code)} />
             </button>
           ) : null}
-          <div className="title-text">
+          <div className="title-text" style={{ minWidth: 0 }}>
             <span
               className="name-text"
               title={f.jzrq === todayStr ? '今日净值已更新' : ''}
@@ -180,6 +193,7 @@ export default function FundCard({
                   <LinkIcon width="14" height="14" />
                 </span>
               ) : null}
+              <ConsecutiveTrendBadge trend={fundExtraData?.consecutiveTrend} />
               {f.name}
             </span>
             <span className="muted">
@@ -229,7 +243,16 @@ export default function FundCard({
           </div>
         </div>
 
-        <div className="actions">
+        <div className="actions" style={{ flex: '0 0 auto', flexWrap: 'nowrap', alignSelf: 'center', marginLeft: 'auto' }}>
+          <div
+            className="badge-v"
+            style={{ cursor: 'pointer', background: 'var(--primary-light, rgba(34, 211, 238, 0.1))', color: 'var(--primary)' }}
+            onClick={() => onDataSourceClick?.(f)}
+            title="点击切换估值数据源"
+          >
+            <span>数据源</span>
+            <strong>{f.dataSource || 1}</strong>
+          </div>
           <div className="badge-v">
             <span>{f.noValuation ? '净值日期' : '估值时间'}</span>
             <strong>
@@ -257,7 +280,14 @@ export default function FundCard({
       </div>
 
       <div className="row" style={{ marginBottom: 12 }}>
-        <Stat label="单位净值" value={f.dwjz ?? '—'} />
+        <Stat
+          label="单位净值"
+          value={
+            f.dwjz != null && !isNaN(Number(f.dwjz))
+              ? Number(f.dwjz).toFixed(4)
+              : (f.dwjz ?? '—')
+          }
+        />
         {f.noValuation ? (
           <Stat
             label="涨跌幅"
@@ -305,19 +335,19 @@ export default function FundCard({
             <Stat
               label="估值净值"
               value={
-                f.estPricedCoverage > 0.05 ? f.estGsz.toFixed(4) : (f.gsz ?? '—')
+                f.gsz != null && !isNaN(Number(f.gsz))
+                  ? Number(f.gsz).toFixed(4)
+                  : (f.gsz ?? '—')
               }
             />
             <Stat
               label="估算涨幅"
               value={
-                f.estPricedCoverage > 0.05
-                  ? `${f.estGszzl > 0 ? '+' : ''}${f.estGszzl.toFixed(2)}%`
-                  : isNumber(f.gszzl)
-                    ? `${f.gszzl > 0 ? '+' : ''}${f.gszzl.toFixed(2)}%`
-                    : f.gszzl ?? '—'
+                isNumber(f.gszzl)
+                  ? `${f.gszzl > 0 ? '+' : ''}${f.gszzl.toFixed(2)}%`
+                  : f.gszzl ?? '—'
               }
-              delta={f.estPricedCoverage > 0.05 ? f.estGszzl : Number(f.gszzl) || 0}
+              delta={Number(f.gszzl) || 0}
             />
           </>
         )}
@@ -368,15 +398,14 @@ export default function FundCard({
                 display: 'flex',
                 alignItems: 'center',
                 gap: 4,
-                cursor: holdingLocked ? 'not-allowed' : 'pointer',
+                cursor: 'pointer',
               }}
-              title={holdingLocked ? holdingLockedTitle : '设置持仓'}
+              title={holdingLocked ? holdingLinkedTitle : '设置持仓'}
               onClick={() => {
-                if (holdingLocked) return;
                 onHoldingClick?.(f);
               }}
             >
-              未设置 {holdingLocked ? null : <SettingsIcon width="12" height="12" />}
+              未设置 <SettingsIcon width="12" height="12" />
             </div>
           </div>
         ) : (
@@ -384,13 +413,12 @@ export default function FundCard({
             <div
               className="stat"
               style={{
-                cursor: holdingLocked ? 'not-allowed' : 'pointer',
+                cursor: 'pointer',
                 flexDirection: 'column',
                 gap: 4,
               }}
-              title={holdingLocked ? holdingLockedTitle : '点击设置持仓'}
+              title={holdingLocked ? holdingLinkedTitle : '点击设置持仓'}
               onClick={() => {
-                if (holdingLocked) return;
                 onActionClick?.(f);
               }}
             >
@@ -398,7 +426,7 @@ export default function FundCard({
                 className="label"
                 style={{ display: 'flex', alignItems: 'center', gap: 4 }}
               >
-                持仓金额 {holdingLocked ? null : <SettingsIcon width="12" height="12" style={{ opacity: 0.7 }} />}
+                持仓金额 <SettingsIcon width="12" height="12" style={{ opacity: 0.7 }} />
               </span>
               <span className="value">
                 {masked ? '******' : `${Number(profit.amount).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
@@ -508,23 +536,9 @@ export default function FundCard({
         )}
       </div>
 
-      {f.estPricedCoverage > 0.05 && (
-        <div
-          style={{
-            fontSize: '10px',
-            color: 'var(--muted)',
-            marginTop: -8,
-            marginBottom: 10,
-            textAlign: 'right',
-          }}
-        >
-          基于 {Math.round(f.estPricedCoverage * 100)}% 持仓估算
-        </div>
-      )}
-
       {(() => {
         const showIntraday =
-          Array.isArray(valuationSeries?.[f.code]) && valuationSeries[f.code].length >= 2;
+          !f.noValuation && Array.isArray(valuationSeries?.[f.code]) && valuationSeries[f.code].length >= 2;
         if (!showIntraday) return null;
 
         if (
@@ -542,11 +556,13 @@ export default function FundCard({
           return null;
         }
 
+        // 以最新收盘净值为基准，与估算涨幅 gszzl 保持一致
+        const dwjz = f.dwjz != null ? Number(f.dwjz) : null;
         return (
           <FundIntradayChart
             key={`${f.code}-intraday-${theme}`}
             series={valuationSeries[f.code]}
-            referenceNav={f.dwjz != null ? Number(f.dwjz) : undefined}
+            referenceNav={dwjz != null && Number.isFinite(dwjz) ? dwjz : undefined}
             theme={theme}
           />
         );
@@ -608,7 +624,16 @@ export default function FundCard({
           )}
           {hasHoldingAmount && (
             <TabsContent value="earnings" className="mt-3 outline-none">
-              <FundDailyEarnings series={displayDailyEarningsSeries} theme={theme} masked={masked} />
+              {displayDailyEarningsSeries.length > 0 ? (
+                <FundDailyEarnings series={displayDailyEarningsSeries} theme={theme} masked={masked} />
+              ) : (
+                <Empty className="py-8 border-none bg-transparent">
+                  <EmptyHeader>
+                    <EmptyTitle>暂无收益数据</EmptyTitle>
+                    <EmptyDescription>该基金暂无历史收益记录</EmptyDescription>
+                  </EmptyHeader>
+                </Empty>
+              )}
             </TabsContent>
           )}
           <TabsContent value="trend" className="mt-3 outline-none">
@@ -727,7 +752,16 @@ export default function FundCard({
                     transition={{ duration: 0.3, ease: 'easeInOut' }}
                     style={{ overflow: 'hidden' }}
                   >
-                    <FundDailyEarnings series={displayDailyEarningsSeries} theme={theme} masked={masked} />
+                    {displayDailyEarningsSeries.length > 0 ? (
+                      <FundDailyEarnings series={displayDailyEarningsSeries} theme={theme} masked={masked} />
+                    ) : (
+                      <Empty className="py-6 border-none bg-transparent">
+                        <EmptyHeader>
+                          <EmptyTitle className="text-sm">暂无收益数据</EmptyTitle>
+                          <EmptyDescription className="text-xs">该基金暂无历史收益记录</EmptyDescription>
+                        </EmptyHeader>
+                      </Empty>
+                    )}
                   </motion.div>
                 )}
               </AnimatePresence>

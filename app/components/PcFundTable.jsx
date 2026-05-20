@@ -36,7 +36,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { DragIcon, SettingsIcon, StarIcon, TrashIcon, ResetIcon, FolderPlusIcon, LinkIcon } from './Icons';
-import { fetchFundPeriodReturns, fetchRelatedSectors, fetchRelatedSectorLiveQuote } from '@/app/api/fund';
+import { ConsecutiveTrendBadge } from './Common';
+import { fetchFundPeriodReturns, fetchRelatedSectorsBatch, fetchFundSecidsBatch, fetchEastmoneySectorQuotesBatch } from '@/app/api/fund';
+import { storageStore } from '../stores';
+import { asyncPool } from '@/app/lib/asyncHelper';
 import MoveGroupModal from './MoveGroupModal';
 import { Badge } from '@/components/ui/badge';
 import { getTagThemeBadgeProps } from '@/app/components/AddTagDialog';
@@ -49,6 +52,7 @@ const NON_FROZEN_COLUMN_IDS = [
   'relatedSector',
   'yesterdayChangePercent',
   'estimateChangePercent',
+  'sinceAddedChangePercent',
   'todayProfit',
   'totalChangePercent',
   'yesterdayProfit',
@@ -67,7 +71,7 @@ const NON_FROZEN_COLUMN_IDS = [
 ];
 
 /** 已保存列显示偏好时，新增列默认隐藏；未保存时随「全展示」 */
-const PC_COLUMNS_DEFAULT_HIDDEN_IF_PERSONALIZED = new Set(['tags', 'holdingCost', 'costNav']);
+const PC_COLUMNS_DEFAULT_HIDDEN_IF_PERSONALIZED = new Set(['tags', 'holdingCost', 'costNav', 'sinceAddedChangePercent']);
 
 /** 非冻结列中右对齐的（标签列左对齐） */
 const isPcDataColumnRightAligned = (id) =>
@@ -84,6 +88,7 @@ const COLUMN_HEADERS = {
   estimateNav: '估算净值',
   yesterdayChangePercent: '最新涨幅',
   estimateChangePercent: '估算涨幅',
+  sinceAddedChangePercent: '自添加来',
   totalChangePercent: '估算收益',
   holdingAmount: '持仓金额',
   holdingCost: '持仓成本',
@@ -196,6 +201,9 @@ export default function PcFundTable({
   onHoldingAmountClick,
   onHoldingProfitClick, // 保留以兼容调用方，表格内已不再使用点击切换
   sortBy = 'default',
+  sortOrder = 'desc',
+  sortRules = [],
+  onSortChange,
   onReorder,
   onCustomSettingsChange,
   getFundCardProps,
@@ -204,9 +212,11 @@ export default function PcFundTable({
   blockDialogClose = false,
   stickyTop = 0,
   masked = false,
-  relatedSectorSessionKey = '',
+  relatedSectorSessionKey,
   onFundTagsClick,
-}) {
+  fundExtraDataByCode = {},
+  }) {
+
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: {
@@ -248,6 +258,29 @@ export default function PcFundTable({
     setActiveId(null);
   };
   const groupKey = currentTab ?? 'all';
+  const currentGroupName = useMemo(() => {
+    if (groupKey === 'all') return '全部';
+    if (groupKey === 'fav') return '自选';
+    return groups.find((g) => g?.id === groupKey)?.name || '当前';
+  }, [groupKey, groups]);
+  const settingSyncOptions = useMemo(() => {
+    const baseOptions = [
+      { id: 'all', name: '全部', description: '全部分组' },
+      { id: 'fav', name: '自选', description: '自选分组' },
+      ...(Array.isArray(groups) ? groups : []).map((group) => ({
+        id: group?.id,
+        name: group?.name || '未命名',
+        description: '自定义分组',
+      })),
+    ];
+    const seen = new Set();
+    return baseOptions.filter((item) => {
+      const id = String(item?.id ?? '').trim();
+      if (!id || id === groupKey || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+  }, [groupKey, groups]);
 
   const isGroupTab = currentTab && currentTab !== 'all' && currentTab !== 'fav';
   // 批量删除：之前仅自定义分组支持，这里扩展到「全部 / 自选 / 自定义分组」
@@ -338,8 +371,7 @@ export default function PcFundTable({
   const getCustomSettingsWithMigration = () => {
     if (typeof window === 'undefined') return {};
     try {
-      const raw = window.localStorage.getItem('customSettings');
-      const parsed = raw ? JSON.parse(raw) : {};
+      const parsed = storageStore.getItem('customSettings') || {};
       if (!parsed || typeof parsed !== 'object') return {};
       if (parsed.pcTableColumnOrder != null || parsed.pcTableColumnVisibility != null || parsed.pcTableColumns != null || parsed.mobileTableColumnOrder != null || parsed.mobileTableColumnVisibility != null) {
         const all = {
@@ -356,7 +388,7 @@ export default function PcFundTable({
         delete parsed.mobileTableColumnOrder;
         delete parsed.mobileTableColumnVisibility;
         parsed.all = all;
-        window.localStorage.setItem('customSettings', JSON.stringify(parsed));
+        storageStore.setItem('customSettings', JSON.stringify(parsed));
       }
       return parsed;
     } catch {
@@ -381,13 +413,17 @@ export default function PcFundTable({
     const visibility = group.pcTableColumnVisibility && typeof group.pcTableColumnVisibility === 'object'
       ? group.pcTableColumnVisibility
       : null;
-    return { sizing: sizingObj, order, visibility };
+    const pinned = Array.isArray(group.pcTableColumnPinned)
+      ? group.pcTableColumnPinned
+      : [];
+    return { sizing: sizingObj, order, visibility, pinned };
   };
 
   const getDefaultPcGroupConfig = () => ({
     order: [...NON_FROZEN_COLUMN_IDS],
     visibility: null,
     sizing: {},
+    pinned: [],
   });
 
   const getInitialConfigByGroup = () => {
@@ -407,6 +443,7 @@ export default function PcFundTable({
           pcTableColumnVisibility: pc.visibility,
           pcTableColumns: Object.keys(pc.sizing).length ? pc.sizing : null,
           pcShowFullFundName: group.pcShowFullFundName === true,
+          pcTableColumnPinned: pc.pinned,
         };
       }
     });
@@ -456,15 +493,15 @@ export default function PcFundTable({
   const persistPcGroupConfig = (updates) => {
     if (typeof window === 'undefined') return;
     try {
-      const raw = window.localStorage.getItem('customSettings');
-      const parsed = raw ? JSON.parse(raw) : {};
+      const parsed = storageStore.getItem('customSettings') || {};
       const group = parsed[groupKey] && typeof parsed[groupKey] === 'object' ? { ...parsed[groupKey] } : {};
       if (updates.pcTableColumnOrder !== undefined) group.pcTableColumnOrder = updates.pcTableColumnOrder;
       if (updates.pcTableColumnVisibility !== undefined) group.pcTableColumnVisibility = updates.pcTableColumnVisibility;
       if (updates.pcTableColumns !== undefined) group.pcTableColumns = updates.pcTableColumns;
+      if (updates.pcTableColumnPinned !== undefined) group.pcTableColumnPinned = updates.pcTableColumnPinned;
       if (updates.pcShowFullFundName !== undefined) group.pcShowFullFundName = updates.pcShowFullFundName;
       parsed[groupKey] = group;
-      window.localStorage.setItem('customSettings', JSON.stringify(parsed));
+      storageStore.setItem('customSettings', JSON.stringify(parsed));
       setConfigByGroup((prev) => ({ ...prev, [groupKey]: { ...prev[groupKey], ...updates } }));
       onCustomSettingsChange?.();
     } catch { }
@@ -472,6 +509,41 @@ export default function PcFundTable({
 
   const handleToggleShowFullFundName = (show) => {
     persistPcGroupConfig({ pcShowFullFundName: show });
+  };
+
+  const handleSyncPcSettings = (targetIds = []) => {
+    if (!targetIds.length || typeof window === 'undefined') return false;
+    try {
+      const parsed = storageStore.getItem('customSettings') || {};
+      const payload = {
+        pcTableColumnOrder: [...columnOrder],
+        pcTableColumnVisibility: { ...columnVisibility },
+        pcTableColumns: { ...columnSizing },
+        pcTableColumnPinned: [...(currentGroupPc?.pcTableColumnPinned || [])],
+        pcShowFullFundName: !!showFullFundName,
+      };
+      const targetUpdates = {};
+      targetIds.forEach((targetId) => {
+        if (!targetId || targetId === groupKey) return;
+        const group = parsed[targetId] && typeof parsed[targetId] === 'object' ? { ...parsed[targetId] } : {};
+        parsed[targetId] = { ...group, ...payload };
+        targetUpdates[targetId] = payload;
+      });
+      const syncedCount = Object.keys(targetUpdates).length;
+      if (syncedCount === 0) return false;
+      storageStore.setItem('customSettings', JSON.stringify(parsed));
+      setConfigByGroup((prev) => {
+        const next = { ...prev };
+        Object.entries(targetUpdates).forEach(([targetId, updates]) => {
+          next[targetId] = { ...next[targetId], ...updates };
+        });
+        return next;
+      });
+      onCustomSettingsChange?.();
+      return syncedCount;
+    } catch {
+      return false;
+    }
   };
 
   const setColumnOrder = (nextOrderOrUpdater) => {
@@ -514,6 +586,30 @@ export default function PcFundTable({
   const handleToggleColumnVisibility = (columnId, visible) => {
     setColumnVisibility((prev = {}) => ({ ...prev, [columnId]: visible }));
   };
+
+  const handleTogglePinColumn = (id) => {
+    const currentPinned = currentGroupPc?.pcTableColumnPinned || [];
+    let nextPinned;
+    let nextOrder;
+
+    if (currentPinned.includes(id)) {
+      nextPinned = currentPinned.filter(c => c !== id);
+      const pinnedPart = columnOrder.filter(c => nextPinned.includes(c));
+      const unpinnedPart = columnOrder.filter(c => !nextPinned.includes(c));
+      nextOrder = [...pinnedPart, ...unpinnedPart];
+    } else {
+      nextPinned = [...currentPinned, id];
+      const existingPinned = columnOrder.filter(c => currentPinned.includes(c));
+      const existingUnpinnedWithoutId = columnOrder.filter(c => !currentPinned.includes(c) && c !== id);
+      nextOrder = [...existingPinned, id, ...existingUnpinnedWithoutId];
+    }
+
+    persistPcGroupConfig({
+      pcTableColumnPinned: nextPinned,
+      pcTableColumnOrder: nextOrder,
+    });
+  };
+
   const onRemoveFundRef = useRef(onRemoveFund);
   const onToggleFavoriteRef = useRef(onToggleFavorite);
   const onHoldingAmountClickRef = useRef(onHoldingAmountClick);
@@ -608,31 +704,11 @@ export default function PcFundTable({
   );
   const dataCodesKey = useMemo(() => dataCodes.join('|'), [dataCodes]);
 
-  const fetchRelatedSector = useCallback(
-    (code) => fetchRelatedSectors(code, { authSegment: sectorAuthSegment }),
-    [sectorAuthSegment],
-  );
-
   useEffect(() => {
     relatedSectorCacheRef.current.clear();
     setRelatedSectorByCode({});
     setSectorQuoteByLabel({});
   }, [sectorAuthSegment]);
-
-  const runWithConcurrency = async (items, limit, worker) => {
-    const queue = [...items];
-    const results = [];
-    const runners = Array.from({ length: Math.max(1, limit) }, async () => {
-      while (queue.length) {
-        const item = queue.shift();
-        if (item == null) continue;
-
-        results.push(await worker(item));
-      }
-    });
-    await Promise.all(runners);
-    return results;
-  };
 
   useEffect(() => {
     if (!relatedSectorEnabled) return;
@@ -643,27 +719,31 @@ export default function PcFundTable({
 
     let cancelled = false;
     (async () => {
-      const batch = {};
-      await runWithConcurrency(missing, 4, async (code) => {
-        const value = await fetchRelatedSector(code);
-        relatedSectorCacheRef.current.set(code, value);
-        batch[code] = value;
-      });
-      if (cancelled) return;
-      setRelatedSectorByCode((prev) => {
-        let changed = false;
-        const next = { ...prev };
-        for (const [code, value] of Object.entries(batch)) {
-          if (next[code] === value) continue;
-          next[code] = value;
-          changed = true;
-        }
-        return changed ? next : prev;
-      });
+      try {
+        const batchResults = await fetchRelatedSectorsBatch(missing, { authSegment: sectorAuthSegment });
+        if (cancelled) return;
+
+        Object.entries(batchResults).forEach(([code, value]) => {
+          relatedSectorCacheRef.current.set(code, value);
+        });
+
+        setRelatedSectorByCode((prev) => {
+          let changed = false;
+          const next = { ...prev };
+          for (const [code, value] of Object.entries(batchResults)) {
+            if (next[code] === value) continue;
+            next[code] = value;
+            changed = true;
+          }
+          return changed ? next : prev;
+        });
+      } catch (e) {
+        console.error('Fetch related sectors batch error:', e);
+      }
     })();
 
     return () => { cancelled = true; };
-  }, [relatedSectorEnabled, dataCodesKey, sectorAuthSegment, fetchRelatedSector, dataCodes]);
+  }, [relatedSectorEnabled, dataCodesKey, sectorAuthSegment, dataCodes]);
 
   useEffect(() => {
     if (!relatedSectorEnabled) return;
@@ -675,36 +755,51 @@ export default function PcFundTable({
       const t = lbl != null ? String(lbl).trim() : '';
       if (t) labels.add(t);
     }
-    if (labels.size === 0) return;
+    const labelList = Array.from(labels);
+    if (labelList.length === 0) return;
 
     let cancelled = false;
     (async () => {
-      const batch = {};
-      await runWithConcurrency([...labels], 4, async (label) => {
-        const quote = await fetchRelatedSectorLiveQuote(label);
-        batch[label] = quote;
-      });
-      if (cancelled) return;
-      setSectorQuoteByLabel((prev) => {
-        let changed = false;
-        const next = { ...prev };
-        for (const [label, quote] of Object.entries(batch)) {
-          const prevQ = next[label];
-          if (prevQ === quote) continue;
-          if (
-            prevQ &&
-            quote &&
-            prevQ.pct === quote.pct &&
-            prevQ.name === quote.name &&
-            prevQ.code === quote.code
-          ) {
-            continue;
-          }
-          next[label] = quote;
-          changed = true;
+      try {
+        // 1. 批量获取 secid
+        const secidResults = await fetchFundSecidsBatch(labelList);
+        if (cancelled) return;
+
+        // 2. 批量获取行情
+        const secids = labelList.map(label => secidResults[label]).filter(Boolean);
+        const quotes = await fetchEastmoneySectorQuotesBatch(secids);
+        const batch = {};
+        for (const label of labelList) {
+          const secid = secidResults[label];
+          if (!secid) continue;
+          const quote = quotes[secid];
+          if (quote) batch[label] = quote;
         }
-        return changed ? next : prev;
-      });
+
+        if (cancelled) return;
+        setSectorQuoteByLabel((prev) => {
+          let changed = false;
+          const next = { ...prev };
+          for (const [label, quote] of Object.entries(batch)) {
+            const prevQ = next[label];
+            if (prevQ === quote) continue;
+            if (
+              prevQ &&
+              quote &&
+              prevQ.pct === quote.pct &&
+              prevQ.name === quote.name &&
+              prevQ.code === quote.code
+            ) {
+              continue;
+            }
+            next[label] = quote;
+            changed = true;
+          }
+          return changed ? next : prev;
+        });
+      } catch (e) {
+        console.error('Fetch sector quotes batch error:', e);
+      }
     })();
 
     return () => { cancelled = true; };
@@ -754,22 +849,16 @@ export default function PcFundTable({
     if (!periodReturnsEnabled) return;
     if (dataCodes.length === 0) return;
 
-    const missing = dataCodes.filter((code) => !periodReturnsCacheRef.current.has(code));
-    if (missing.length === 0) return;
-
-    let cancelled = false;
-    (async () => {
-      const batch = {};
-      await runWithConcurrency(missing, 4, async (code) => {
-        const value = await fetchFundPeriodReturns(code);
-        periodReturnsCacheRef.current.set(code, value);
-        batch[code] = value;
-      });
-      if (cancelled) return;
+    const cachedBatch = {};
+    for (const code of dataCodes) {
+      if (!periodReturnsCacheRef.current.has(code)) continue;
+      cachedBatch[code] = periodReturnsCacheRef.current.get(code);
+    }
+    if (Object.keys(cachedBatch).length > 0) {
       setPeriodReturnsByCode((prev) => {
         let changed = false;
         const next = { ...prev };
-        for (const [code, value] of Object.entries(batch)) {
+        for (const [code, value] of Object.entries(cachedBatch)) {
           const prevVal = next[code];
           if (
             prevVal
@@ -785,6 +874,32 @@ export default function PcFundTable({
           changed = true;
         }
         return changed ? next : prev;
+      });
+    }
+
+    const missing = dataCodes.filter((code) => !periodReturnsCacheRef.current.has(code));
+    if (missing.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      await asyncPool(4, missing, async (code) => {
+        const value = await fetchFundPeriodReturns(code);
+        periodReturnsCacheRef.current.set(code, value);
+        if (cancelled) return;
+        setPeriodReturnsByCode((prev) => {
+          const prevVal = prev[code];
+          if (
+            prevVal
+            && prevVal.week === value.week
+            && prevVal.month === value.month
+            && prevVal.month3 === value.month3
+            && prevVal.month6 === value.month6
+            && prevVal.year1 === value.year1
+          ) {
+            return prev;
+          }
+          return { ...prev, [code]: value };
+        });
       });
     })();
 
@@ -899,7 +1014,7 @@ export default function PcFundTable({
         >
           <span
             className={`name-text ${showFullFundName ? 'show-full' : ''}`}
-            title={isUpdated ? '今日净值已更新' : ''}
+            title={info.getValue() ?? undefined}
           >
             {holdingLocked ? (
               <span
@@ -918,6 +1033,7 @@ export default function PcFundTable({
                 <LinkIcon width="14" height="14" />
               </span>
             ) : null}
+            <ConsecutiveTrendBadge trend={fundExtraDataByCode?.[code]?.consecutiveTrend} />
             {info.getValue() ?? '—'}
           </span>
           {code ? <span className="muted code-text">
@@ -961,8 +1077,8 @@ export default function PcFundTable({
             />
           );
         },
-        size: 265,
-        minSize: 140,
+        size: 300,
+        minSize: 280,
         enablePinning: true,
         cell: (info) => (
           <FundNameCell
@@ -1069,6 +1185,17 @@ export default function PcFundTable({
                 gap: 2,
               }}
             >
+              {pctText != null ? (
+                <FitText
+                  className={pctCls}
+                  style={{ fontWeight: 700, textAlign: 'right' }}
+                  maxFontSize={14}
+                  minFontSize={10}
+                  as="div"
+                >
+                  {pctText}
+                </FitText>
+              ) : null}
               <span
                 title={firstLine !== '—' ? firstLine : undefined}
                 style={{
@@ -1079,19 +1206,11 @@ export default function PcFundTable({
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
                   textAlign: 'right',
-                  fontSize: '14px',
+                  fontSize: pctText != null ? '11px' : '14px',
                 }}
               >
                 {firstLine}
               </span>
-              {pctText != null ? (
-                <span
-                  className={pctCls}
-                  style={{ fontSize: '11px', fontWeight: 600, textAlign: 'right' }}
-                >
-                  {pctText}
-                </span>
-              ) : null}
             </div>
           );
         },
@@ -1329,6 +1448,37 @@ export default function PcFundTable({
         },
       },
       {
+        accessorKey: 'sinceAddedChangePercent',
+        header: '自添加来',
+        size: 135,
+        minSize: 100,
+        cell: (info) => {
+          const original = info.row.original || {};
+          const value = original.sinceAddedChangeValue;
+          const cls = value == null ? 'muted' : value > 0 ? 'up' : value < 0 ? 'down' : '';
+          const rawDate = original.sinceAddedDateRaw ?? '';
+          const displayDate = original.sinceAddedDate ?? '';
+          const text = info.getValue();
+          const hasText = text != null && text !== '—';
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0 }}>
+              <FitText className={cls} style={{ fontWeight: 700 }} maxFontSize={14} minFontSize={10} as="div">
+                {text ?? '—'}
+              </FitText>
+              {hasText && displayDate ? (
+                <span className="muted" title={rawDate && rawDate !== displayDate ? rawDate : undefined} style={{ fontSize: '11px' }}>
+                  {displayDate}
+                </span>
+              ) : null}
+            </div>
+          );
+        },
+        meta: {
+          align: 'right',
+          cellClassName: 'since-added-cell',
+        },
+      },
+      {
         accessorKey: 'totalChangePercent',
         header: '估算收益',
         size: 135,
@@ -1371,30 +1521,28 @@ export default function PcFundTable({
           const holdingLocked =
             (currentTab === 'all' || currentTab === 'fav') &&
             !!original.isHoldingLinked;
-          const holdingLockedTitle = '持仓来自自定义分组汇总，无法在「全部/自选」设置持仓金额';
+          const holdingLinkedTitle = '持仓来自自定义分组汇总，点击选择分组后操作';
           if (original.holdingAmountValue == null) {
             return (
               <div
-                role={holdingLocked ? undefined : 'button'}
-                tabIndex={holdingLocked ? -1 : 0}
+                role="button"
+                tabIndex={0}
                 className="muted"
-                title={holdingLocked ? holdingLockedTitle : '设置持仓'}
+                title={holdingLocked ? holdingLinkedTitle : '设置持仓'}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: 4,
                   fontSize: '12px',
-                  cursor: holdingLocked ? 'not-allowed' : 'pointer',
+                  cursor: 'pointer',
                 }}
                 onClick={(e) => {
                   e.stopPropagation?.();
-                  if (holdingLocked) return;
                   onHoldingAmountClickRef.current?.(original, { hasHolding: false });
                 }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
-                    if (holdingLocked) return;
                     onHoldingAmountClickRef.current?.(original, { hasHolding: false });
                   }
                 }}
@@ -1405,17 +1553,16 @@ export default function PcFundTable({
           }
           return (
             <div
-              title={holdingLocked ? holdingLockedTitle : '点击设置持仓'}
+              title={holdingLocked ? holdingLinkedTitle : '点击设置持仓'}
               style={{
                 display: 'flex',
                 alignItems: 'center',
-                cursor: holdingLocked ? 'not-allowed' : 'pointer',
+                cursor: 'pointer',
                 width: '100%',
                 minWidth: 0,
               }}
               onClick={(e) => {
                 e.stopPropagation?.();
-                if (holdingLocked) return;
                 onHoldingAmountClickRef.current?.(original, { hasHolding: true });
               }}
             >
@@ -1428,11 +1575,9 @@ export default function PcFundTable({
                 className="icon-button no-hover"
                 onClick={(e) => {
                   e.stopPropagation?.();
-                  if (holdingLocked) return;
                   onHoldingAmountClickRef.current?.(original, { hasHolding: true });
                 }}
-                title={holdingLocked ? holdingLockedTitle : '编辑持仓'}
-                disabled={holdingLocked}
+                title={holdingLocked ? holdingLinkedTitle : '编辑持仓'}
                 style={{
                   border: 'none',
                   width: '28px',
@@ -1441,7 +1586,7 @@ export default function PcFundTable({
                   flexShrink: 0,
                   backgroundColor: 'transparent',
                   color: holdingLocked ? 'var(--muted)' : undefined,
-                  cursor: holdingLocked ? 'not-allowed' : 'pointer',
+                  cursor: 'pointer',
                 }}
               >
                 <SettingsIcon width="14" height="14" />
@@ -1716,6 +1861,13 @@ export default function PcFundTable({
       columnSizing,
       columnOrder,
       columnVisibility,
+      columnPinning: {
+        left: [
+          'fundName',
+          ...columnOrder.filter(id => (currentGroupPc?.pcTableColumnPinned || []).includes(id))
+        ],
+        right: ['actions'],
+      },
     },
     onColumnOrderChange: (updater) => {
       setColumnOrder(updater);
@@ -1778,7 +1930,12 @@ export default function PcFundTable({
     const style = {
       width: `${column.getSize()}px`,
     };
-    if (!isPinned) return style;
+    if (!isPinned) {
+      return {
+        ...style,
+        zIndex: isHeader ? 1 : 0,
+      };
+    }
 
     const isLeft = isPinned === 'left';
     const isRight = isPinned === 'right';
@@ -1796,6 +1953,37 @@ export default function PcFundTable({
     };
   };
 
+  const getSortHeaderMeta = useCallback((columnId) => {
+    const sortMap = {
+      fundName: 'name',
+      tags: 'tags',
+      yesterdayChangePercent: 'yesterdayIncrease',
+      estimateChangePercent: 'yield',
+      totalChangePercent: 'estimateProfit',
+      holdingAmount: 'holdingAmount',
+      todayProfit: 'todayProfit',
+      yesterdayProfit: 'yesterdayProfit',
+      holdingProfit: 'holding',
+      holdingDays: 'holdingDays',
+      holdingCost: 'holdingCost',
+      period1w: 'last1Week',
+      period1m: 'last1Month',
+      period3m: 'last3Months',
+      period6m: 'last6Months',
+      period1y: 'last1Year',
+    };
+    const sortKey = sortMap[columnId];
+    const isSorted = !!sortBy && sortKey === sortBy;
+    let isSortEnabled = !!sortKey && (sortRules || []).some((rule) => rule?.id === sortKey && !!rule?.enabled);
+
+    // 选择默认排序时，隐藏基金名称表头的排序和箭头
+    if (sortBy === 'default' && sortKey === 'name') {
+      isSortEnabled = false;
+    }
+
+    return { sortKey, isSorted, isSortEnabled };
+  }, [sortBy, sortRules]);
+
   const renderTableHeader = (forPortal = false) => {
     if (!headerGroup) return null;
     return (
@@ -1807,19 +1995,53 @@ export default function PcFundTable({
             header.column.columnDef?.accessorKey === 'fundName';
           const isRightAligned = NON_FROZEN_COLUMN_IDS.includes(header.column.id);
           const align = isNameColumn ? '' : isRightAligned ? 'text-right' : 'text-center';
+
+          const colId = header.column.id || header.column.columnDef?.accessorKey;
+          const { sortKey, isSorted, isSortEnabled } = getSortHeaderMeta(colId);
+
           return (
             <div
               key={header.id}
-              className={`table-header-cell ${align}`}
-              style={style}
+              className={`table-header-cell ${align} ${isSortEnabled ? 'sortable' : ''}`}
+              style={{
+                ...style,
+                cursor: isSortEnabled ? 'pointer' : 'default',
+                userSelect: isSortEnabled ? 'none' : 'auto'
+              }}
+              onClick={() => {
+                if (isSortEnabled && onSortChange) {
+                  onSortChange(sortKey);
+                }
+              }}
             >
-              <div style={{ paddingRight: isRightAligned ? '20px' : '0' }}>
+              <div
+                style={{
+                  paddingRight: isRightAligned ? '20px' : '0',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 4,
+                }}
+              >
                 {header.isPlaceholder
                   ? null
                   : flexRender(
                     header.column.columnDef.header,
                     header.getContext(),
                   )}
+                {isSortEnabled && (
+                  <span
+                    style={{
+                      display: 'inline-flex',
+                      flexDirection: 'column',
+                      lineHeight: 1,
+                      fontSize: '8px',
+                      opacity: isSorted ? 1 : 0.3
+                    }}
+                  >
+                    <span style={{ opacity: isSorted && sortOrder === 'asc' ? 1 : 0.3 }}>▲</span>
+                    <span style={{ opacity: isSorted && sortOrder === 'desc' ? 1 : 0.3 }}>▼</span>
+                  </span>
+                )}
               </div>
               {!forPortal && (
                 <div
@@ -1827,6 +2049,7 @@ export default function PcFundTable({
                   onTouchStart={header.column.getCanResize() ? header.getResizeHandler() : undefined}
                   className={`resizer ${header.column.getIsResizing() ? 'isResizing' : ''
                     } ${header.column.getCanResize() ? '' : 'disabled'}`}
+                  onClick={(e) => e.stopPropagation()}
                 />
               )}
             </div>
@@ -1878,6 +2101,7 @@ export default function PcFundTable({
         .table-header-row-scroll,
         .table-row-scroll {
           display: flex !important;
+          align-items: stretch !important; /* 让每个单元格撑满行高 */
           width: fit-content !important;
           min-width: 100%;
           gap: 0 !important; /* Reset gap because we control width explicitly */
@@ -1885,6 +2109,8 @@ export default function PcFundTable({
 
         .table-header-cell,
         .table-cell {
+          display: flex !important;
+          align-items: center; /* 保持单元格内容垂直居中 */
           flex-shrink: 0;
           box-sizing: border-box;
           padding-left: 8px;
@@ -1950,68 +2176,90 @@ export default function PcFundTable({
 
         {/* 表体 */}
         {enableVirtualization ? (
-          <div
-            ref={virtualScrollAnchorRef}
-            className="pc-fund-table-body-virtual"
-            style={{ position: 'relative', width: '100%' }}
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
+            onDragCancel={handleDragCancel}
+            modifiers={[restrictToVerticalAxis, restrictToParentElement]}
           >
-            <div
-              style={{
-                height: rowVirtualizer.getTotalSize(),
-                position: 'relative',
-                width: '100%',
-              }}
+            <SortableContext
+              items={data.map((item) => item.code)}
+              strategy={verticalListSortingStrategy}
             >
-            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-              const row = tableRows[virtualRow.index];
-              if (!row) return null;
-              return (
+              <div
+                ref={virtualScrollAnchorRef}
+                className="pc-fund-table-body-virtual"
+                style={{ position: 'relative', width: '100%' }}
+              >
                 <div
-                  key={row.original.code || row.id}
-                  data-index={virtualRow.index}
-                  ref={rowVirtualizer.measureElement}
                   style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
+                    height: rowVirtualizer.getTotalSize(),
+                    position: 'relative',
                     width: '100%',
-                    transform: `translateY(${virtualRow.start - rowVirtualizer.options.scrollMargin}px)`,
                   }}
                 >
-                  <div
-                    className={`table-row table-row-scroll ${virtualRow.index % 2 === 1 ? 'row-even' : ''}`}
-                  >
-                    {row.getVisibleCells().map((cell) => {
-                      const columnId = cell.column.id || cell.column.columnDef?.accessorKey;
-                      const isNameColumn = columnId === 'fundName';
-                      const align = isNameColumn
-                        ? ''
-                        : NON_FROZEN_COLUMN_IDS.includes(columnId)
-                          ? 'text-right'
-                          : 'text-center';
-                      const cellClassName =
-                        (cell.column.columnDef.meta && cell.column.columnDef.meta.cellClassName) || '';
-                      const style = getCommonPinningStyles(cell.column, false);
-                      const isPinned = cell.column.getIsPinned();
-                      return (
+                {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                  const row = tableRows[virtualRow.index];
+                  if (!row) return null;
+                  return (
+                    <div
+                      key={row.original.code || row.id}
+                      data-index={virtualRow.index}
+                      ref={rowVirtualizer.measureElement}
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        transform: `translateY(${virtualRow.start - rowVirtualizer.options.scrollMargin}px)`,
+                        zIndex: activeId === row.original.code ? 9999 : 1,
+                      }}
+                    >
+                      <SortableRow
+                        row={row}
+                        isTableDragging={!!activeId}
+                        disabled={sortBy !== 'default'}
+                        enableAnimation={false}
+                      >
                         <div
-                          key={cell.id}
-                          className={`table-cell ${align} ${cellClassName} ${isPinned ? 'pinned-cell' : ''}`}
-                          style={style}
+                          className={`table-row table-row-scroll ${virtualRow.index % 2 === 1 ? 'row-even' : ''}`}
                         >
-                          {flexRender(
-                            cell.column.columnDef.cell,
-                            cell.getContext(),
-                          )}
+                          {row.getVisibleCells().map((cell) => {
+                            const columnId = cell.column.id || cell.column.columnDef?.accessorKey;
+                            const isNameColumn = columnId === 'fundName';
+                            const align = isNameColumn
+                              ? ''
+                              : NON_FROZEN_COLUMN_IDS.includes(columnId)
+                                ? 'text-right'
+                                : 'text-center';
+                            const cellClassName =
+                              (cell.column.columnDef.meta && cell.column.columnDef.meta.cellClassName) || '';
+                            const style = getCommonPinningStyles(cell.column, false);
+                            const isPinned = cell.column.getIsPinned();
+                            return (
+                              <div
+                                key={cell.id}
+                                className={`table-cell ${align} ${cellClassName} ${isPinned ? 'pinned-cell' : ''}`}
+                                style={style}
+                              >
+                                {flexRender(
+                                  cell.column.columnDef.cell,
+                                  cell.getContext(),
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
-                      );
-                    })}
-                  </div>
+                      </SortableRow>
+                    </div>
+                  );
+                })}
                 </div>
-              );
-            })}
-            </div>
-          </div>
+              </div>
+            </SortableContext>
+          </DndContext>
         ) : (
           <DndContext
             sensors={sensors}
@@ -2157,19 +2405,51 @@ export default function PcFundTable({
                   header.column.columnDef?.accessorKey === 'fundName';
                 const isRightAligned = NON_FROZEN_COLUMN_IDS.includes(header.column.id);
                 const align = isNameColumn ? '' : isRightAligned ? 'text-right' : 'text-center';
+                const colId = header.column.id || header.column.columnDef?.accessorKey;
+                const { sortKey, isSorted, isSortEnabled } = getSortHeaderMeta(colId);
                 return (
                   <div
                     key={header.id}
-                    className={`table-header-cell ${align}`}
-                    style={style}
+                    className={`table-header-cell ${align} ${isSortEnabled ? 'sortable' : ''}`}
+                    style={{
+                      ...style,
+                      cursor: isSortEnabled ? 'pointer' : 'default',
+                      userSelect: isSortEnabled ? 'none' : 'auto',
+                    }}
+                    onClick={() => {
+                      if (isSortEnabled && onSortChange) {
+                        onSortChange(sortKey);
+                      }
+                    }}
                   >
-                    <div style={{ paddingRight: isRightAligned ? '20px' : '0' }}>
+                    <div
+                      style={{
+                        paddingRight: isRightAligned ? '20px' : '0',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 4,
+                      }}
+                    >
                       {header.isPlaceholder
                         ? null
                         : flexRender(
                           header.column.columnDef.header,
                           header.getContext(),
                         )}
+                      {isSortEnabled && (
+                        <span
+                          style={{
+                            display: 'inline-flex',
+                            flexDirection: 'column',
+                            lineHeight: 1,
+                            fontSize: '8px',
+                            opacity: isSorted ? 1 : 0.3,
+                          }}
+                        >
+                          <span style={{ opacity: isSorted && sortOrder === 'asc' ? 1 : 0.3 }}>▲</span>
+                          <span style={{ opacity: isSorted && sortOrder === 'desc' ? 1 : 0.3 }}>▼</span>
+                        </span>
+                      )}
                     </div>
                   </div>
                 );
@@ -2195,12 +2475,17 @@ export default function PcFundTable({
           setColumnOrder(newOrder);
         }}
         columnVisibility={columnVisibility}
+        pinnedColumns={currentGroupPc?.pcTableColumnPinned || []}
         onToggleColumnVisibility={handleToggleColumnVisibility}
+        onTogglePinColumn={handleTogglePinColumn}
         onResetColumnOrder={handleResetColumnOrder}
         onResetColumnVisibility={handleResetColumnVisibility}
         onResetSizing={() => setResetConfirmOpen(true)}
         showFullFundName={showFullFundName}
         onToggleShowFullFundName={handleToggleShowFullFundName}
+        syncOptions={settingSyncOptions}
+        currentGroupName={currentGroupName}
+        onSyncSettings={handleSyncPcSettings}
       />
       {moveGroupOpen && (
         <MoveGroupModal
